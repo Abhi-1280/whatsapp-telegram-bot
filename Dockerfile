@@ -1,18 +1,18 @@
-FROM ghcr.io/puppeteer/puppeteer:21.5.2
+FROM node:18-alpine
 
 WORKDIR /app
 
-# Copy package files as root
-COPY --chown=pptruser:pptruser package*.json ./
+# Copy package files
+COPY package*.json ./
 
-# Switch to pptruser to install dependencies
-USER pptruser
+# Install dependencies
+RUN npm ci --only=production
 
-RUN npm install
+# Copy application files
+COPY . .
 
-# Copy rest of the application
-COPY --chown=pptruser:pptruser . .
-
+# Expose port
 EXPOSE 10000
 
+# Start the application
 CMD ["node", "index.js"]

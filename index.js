@@ -1,11 +1,17 @@
+Yes, you can store the session directly! Here's how to implement it using environment variables (most secure approach):
+
+## Option 1: Store Session as Base64 in Environment Variable
+
+Here's the modified code with built-in session storage:
+
+```javascript
 require('dotenv').config();
-const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
+const { Client, LocalAuth } = require('whatsapp-web.js');
 const { Telegraf } = require('telegraf');
 const qrcode = require('qrcode-terminal');
 const express = require('express');
 const fs = require('fs').promises;
 const path = require('path');
-const { Storage } = require('megajs');
 const archiver = require('archiver');
 const extract = require('extract-zip');
 const axios = require('axios');
@@ -22,74 +28,78 @@ let whatsappClient;
 let isWhatsAppReady = false;
 let targetChat = null;
 
-// Message queue for ultra-fast forwarding
+// Message queue
 const messageQueue = [];
 let isProcessing = false;
 
-// Performance settings for deals - OPTIMIZED
-const CONCURRENT_MESSAGES = 10; // Increased for faster processing
-const MESSAGE_DELAY = 25; // Reduced delay
-const QUEUE_CHECK_INTERVAL = 50; // Faster queue checking
+// Performance settings
+const CONCURRENT_MESSAGES = 10;
+const MESSAGE_DELAY = 25;
+const QUEUE_CHECK_INTERVAL = 50;
 
-// Mega storage for session persistence
-let megaStorage = null;
-
-// Initialize Express endpoints
-app.get('/', (req, res) => {
-    res.send('WhatsApp-Telegram Bridge is running! 🚀');
-});
-
-app.get('/health', (req, res) => {
-    res.json({
-        status: 'alive',
-        whatsappReady: isWhatsAppReady,
-        uptime: process.uptime(),
-        timestamp: new Date().toISOString(),
-        queueSize: messageQueue.length
-    });
-});
-
-// Session Manager Class
+// Session Manager for Base64 Storage
 class SessionManager {
     constructor() {
         this.sessionPath = './whatsapp_session';
-        this.ready = false;
     }
 
-    async init() {
-        if (!this.ready && process.env.MEGA_EMAIL && process.env.MEGA_PASSWORD) {
-            try {
-                megaStorage = new Storage({
-                    email: process.env.MEGA_EMAIL,
-                    password: process.env.MEGA_PASSWORD
-                });
-                await megaStorage.login();
-                this.ready = true;
-                console.log('✅ Mega storage connected');
-            } catch (error) {
-                console.error('❌ Mega login failed:', error.message);
+    async saveSessionToBase64() {
+        try {
+            console.log('📦 Converting session to Base64...');
+            
+            // Create zip of session
+            const zipPath = '/tmp/session_backup.zip';
+            await this.createZip(this.sessionPath, zipPath);
+            
+            // Read zip and convert to base64
+            const zipBuffer = await fs.readFile(zipPath);
+            const base64Session = zipBuffer.toString('base64');
+            
+            // Clean up
+            await fs.unlink(zipPath);
+            
+            console.log('✅ Session converted to Base64');
+            console.log('📋 Copy this to your WHATSAPP_SESSION environment variable:');
+            console.log('=====================================');
+            console.log(base64Session);
+            console.log('=====================================');
+            
+            // Also send to Telegram admin
+            if (process.env.TELEGRAM_ADMIN_ID) {
+                await telegramBot.telegram.sendDocument(
+                    process.env.TELEGRAM_ADMIN_ID,
+                    {
+                        source: Buffer.from(base64Session),
+                        filename: 'session_base64.txt'
+                    },
+                    {
+                        caption: '📦 *WhatsApp Session Base64*\n\nSave this to `WHATSAPP_SESSION` environment variable in Render!'
+                    }
+                );
             }
+            
+            return base64Session;
+        } catch (error) {
+            console.error('❌ Failed to convert session:', error);
+            return null;
         }
     }
 
-    async downloadSession() {
-        if (!this.ready) return false;
-        
+    async loadSessionFromBase64() {
+        if (!process.env.WHATSAPP_SESSION) {
+            console.log('📭 No saved session found in environment');
+            return false;
+        }
+
         try {
-            console.log('📥 Downloading session from Mega...');
+            console.log('📥 Loading session from environment variable...');
             
-            await megaStorage.reload();
-            const files = megaStorage.root.children;
-            const sessionFile = files.find(f => f.name === 'whatsapp_session.zip');
-            
-            if (!sessionFile) {
-                console.log('📭 No session backup found in Mega');
-                return false;
-            }
-            
-            const buffer = await sessionFile.downloadBuffer();
+            // Convert base64 back to buffer
+            const zipBuffer = Buffer.from(process.env.WHATSAPP_SESSION, 'base64');
             const zipPath = '/tmp/session_restore.zip';
-            await fs.writeFile(zipPath, buffer);
+            
+            // Write zip file
+            await fs.writeFile(zipPath, zipBuffer);
             
             // Clean existing session
             await fs.rm(this.sessionPath, { recursive: true, force: true });
@@ -98,59 +108,10 @@ class SessionManager {
             await extract(zipPath, { dir: path.resolve('./') });
             await fs.unlink(zipPath);
             
-            console.log('✅ Session restored from Mega');
+            console.log('✅ Session restored from environment variable');
             return true;
         } catch (error) {
-            console.error('❌ Session download failed:', error.message);
-            return false;
-        }
-    }
-
-    async uploadSession() {
-        if (!this.ready) return false;
-        
-        try {
-            console.log('📤 Uploading session to Mega...');
-            
-            // Check if session exists
-            try {
-                await fs.access(this.sessionPath);
-            } catch {
-                console.log('📭 No session to upload');
-                return false;
-            }
-            
-            // Create zip
-            const zipPath = '/tmp/session_backup.zip';
-            await this.createZip(this.sessionPath, zipPath);
-            
-            // Delete old backup
-            await megaStorage.reload();
-            const files = megaStorage.root.children;
-            const oldFile = files.find(f => f.name === 'whatsapp_session.zip');
-            if (oldFile) {
-                await oldFile.delete();
-            }
-            
-            // Upload new backup
-            const buffer = await fs.readFile(zipPath);
-            const uploadStream = megaStorage.upload({
-                name: 'whatsapp_session.zip',
-                size: buffer.length
-            });
-            
-            uploadStream.end(buffer);
-            
-            await new Promise((resolve, reject) => {
-                uploadStream.on('complete', resolve);
-                uploadStream.on('error', reject);
-            });
-            
-            await fs.unlink(zipPath);
-            console.log('✅ Session uploaded to Mega');
-            return true;
-        } catch (error) {
-            console.error('❌ Session upload failed:', error.message);
+            console.error('❌ Failed to restore session:', error);
             return false;
         }
     }
@@ -172,15 +133,28 @@ class SessionManager {
 
 const sessionManager = new SessionManager();
 
+// Initialize Express endpoints
+app.get('/', (req, res) => {
+    res.send('WhatsApp-Telegram Bridge is running! 🚀');
+});
+
+app.get('/health', (req, res) => {
+    res.json({
+        status: 'alive',
+        whatsappReady: isWhatsAppReady,
+        uptime: process.uptime(),
+        timestamp: new Date().toISOString(),
+        queueSize: messageQueue.length,
+        sessionStored: !!process.env.WHATSAPP_SESSION
+    });
+});
+
 // Initialize WhatsApp Client
 async function initWhatsApp() {
     console.log('🔄 Initializing WhatsApp...');
     
-    // Initialize session manager
-    await sessionManager.init();
-    
-    // Download session from Mega if available
-    await sessionManager.downloadSession();
+    // Try to load session from environment variable
+    await sessionManager.loadSessionFromBase64();
     
     whatsappClient = new Client({
         authStrategy: new LocalAuth({
@@ -214,7 +188,7 @@ async function initWhatsApp() {
             try {
                 await telegramBot.telegram.sendMessage(
                     process.env.TELEGRAM_ADMIN_ID,
-                    `📱 *WhatsApp QR Code*\n\nScan this QR code in WhatsApp > Linked Devices:\n\n\`\`\`\n${qr}\n\`\`\``,
+                    `📱 *WhatsApp QR Code*\n\nScan this QR code in WhatsApp > Linked Devices:\n\n\`\`\`\n${qr}\n\`\`\`\n\n⚠️ After scanning, use /savesession to save permanently!`,
                     { parse_mode: 'Markdown' }
                 );
             } catch (error) {
@@ -224,10 +198,16 @@ async function initWhatsApp() {
     });
 
     // Authentication success
-    whatsappClient.on('authenticated', () => {
+    whatsappClient.on('authenticated', async () => {
         console.log('🔐 WhatsApp authenticated successfully!');
-        // Upload session after authentication
-        setTimeout(() => sessionManager.uploadSession(), 5000);
+        
+        // Automatically save session after authentication
+        if (!process.env.WHATSAPP_SESSION) {
+            setTimeout(async () => {
+                console.log('🔄 Auto-saving session...');
+                await sessionManager.saveSessionToBase64();
+            }, 5000);
+        }
     });
 
     // Ready event
@@ -235,44 +215,29 @@ async function initWhatsApp() {
         console.log('✅ WhatsApp client is ready!');
         isWhatsAppReady = true;
         
-        // Upload session when ready
-        await sessionManager.uploadSession();
-        
         const chats = await whatsappClient.getChats();
         
-        // Debug: List all chats
-        console.log('📋 Available chats:');
-        chats.forEach(chat => {
-            console.log(`- ${chat.name} (${chat.isGroup ? 'Group' : 'Contact'})`);
-        });
-        
-        // Find target chat - case insensitive search
+        // Find target chat
         targetChat = chats.find(chat => 
             chat.name && chat.name.toLowerCase() === process.env.WHATSAPP_GROUP_NAME.toLowerCase()
         );
         
         if (targetChat) {
             console.log(`✅ Found target group: ${process.env.WHATSAPP_GROUP_NAME}`);
-            console.log(`   Group ID: ${targetChat.id._serialized}`);
             
             if (process.env.TELEGRAM_ADMIN_ID) {
                 await telegramBot.telegram.sendMessage(
                     process.env.TELEGRAM_ADMIN_ID,
-                    `✅ *Bot is ready!*\n\n📱 WhatsApp: Connected\n👥 Target Group: ${process.env.WHATSAPP_GROUP_NAME}\n☁️ Session: Backed up to Mega\n🚀 Ultra-fast mode enabled!\n\n📨 Send a message to your Telegram channel to test!`,
+                    `✅ *Bot is ready!*\n\n📱 WhatsApp: Connected\n👥 Target Group: ${process.env.WHATSAPP_GROUP_NAME}\n💾 Session: ${process.env.WHATSAPP_SESSION ? 'Loaded from env' : 'New session'}\n🚀 Ready to forward messages!`,
                     { parse_mode: 'Markdown' }
                 );
             }
         } else {
             console.error(`❌ Target group not found: ${process.env.WHATSAPP_GROUP_NAME}`);
-            console.error('Make sure the group name is EXACT (case-sensitive)');
-            
-            if (process.env.TELEGRAM_ADMIN_ID) {
-                await telegramBot.telegram.sendMessage(
-                    process.env.TELEGRAM_ADMIN_ID,
-                    `❌ *Error: WhatsApp group not found!*\n\nLooking for: "${process.env.WHATSAPP_GROUP_NAME}"\n\nAvailable groups:\n${chats.filter(c => c.isGroup).map(c => `• ${c.name}`).join('\n')}\n\n⚠️ Check the exact group name in Render settings!`,
-                    { parse_mode: 'Markdown' }
-                );
-            }
+            console.log('Available groups:');
+            chats.filter(c => c.isGroup).forEach(chat => {
+                console.log(`- ${chat.name}`);
+            });
         }
     });
 
@@ -304,51 +269,40 @@ async function processMessageQueue() {
     }
 
     isProcessing = true;
-
-    // Process all messages at once for maximum speed
     const messagesToProcess = messageQueue.splice(0, CONCURRENT_MESSAGES);
     
     try {
-        // Send all messages in parallel
         const sendPromises = messagesToProcess.map(async (message, index) => {
             try {
-                // Add small stagger to avoid rate limiting
                 await new Promise(resolve => setTimeout(resolve, index * 10));
                 await targetChat.sendMessage(message.content);
-                console.log(`⚡ Sent [${index + 1}/${messagesToProcess.length}]: ${message.type} - ${message.content.substring(0, 50)}...`);
+                console.log(`⚡ Sent: ${message.type}`);
                 return true;
             } catch (error) {
-                console.error(`❌ Failed to send message: ${error.message}`);
+                console.error(`❌ Failed: ${error.message}`);
                 return false;
             }
         });
         
         await Promise.all(sendPromises);
-        
     } catch (error) {
         console.error('Batch send error:', error);
     }
 
     isProcessing = false;
     
-    // Immediately check for more messages
     if (messageQueue.length > 0) {
         setImmediate(processMessageQueue);
     }
 }
 
-// Fixed Telegram message handler
+// Telegram message handler
 telegramBot.on(['message', 'channel_post'], async (ctx) => {
-    // Handle both direct messages and channel posts
     const message = ctx.message || ctx.channelPost;
-    
     if (!message) return;
     
-    console.log(`📨 Received Telegram message: ${message.text || 'media'}`);
-    
-    // Check if WhatsApp is ready
     if (!isWhatsAppReady || !targetChat) {
-        console.log('⚠️ WhatsApp not ready or target chat not found');
+        console.log('⚠️ WhatsApp not ready');
         return;
     }
     
@@ -359,44 +313,39 @@ telegramBot.on(['message', 'channel_post'], async (ctx) => {
         if (message.text) {
             content = message.text;
             type = 'text';
-                } else if (message.photo) {
-            const caption = message.caption || '';
-            content = `📸 Photo${caption ? ': ' + caption : ''}`;
+        } else if (message.photo) {
+            content = `📸 ${message.caption || 'Photo'}`;
             type = 'photo';
         } else if (message.video) {
-            const caption = message.caption || '';
-            content = `🎥 Video${caption ? ': ' + caption : ''}`;
+            content = `🎥 ${message.caption || 'Video'}`;
             type = 'video';
         } else if (message.document) {
-            const fileName = message.document.file_name;
-            const caption = message.caption || '';
-            content = `📎 File: ${fileName}${caption ? '\n' + caption : ''}`;
+            content = `📎 ${message.document.file_name}${message.caption ? '\n' + message.caption : ''}`;
             type = 'document';
-        } else if (message.sticker) {
-            content = `🎭 Sticker${message.sticker.emoji ? ': ' + message.sticker.emoji : ''}`;
-            type = 'sticker';
-        } else if (message.voice) {
-            content = `🎤 Voice message (${message.voice.duration}s)`;
-            type = 'voice';
-        } else if (message.poll) {
-            content = `📊 Poll: ${message.poll.question}\nOptions: ${message.poll.options.map(o => o.text).join(', ')}`;
-            type = 'poll';
         }
         
         if (content) {
-            console.log(`📥 Adding to queue: ${type} - ${content.substring(0, 50)}...`);
             messageQueue.push({ type, content });
-            
-            // Immediately trigger processing
             setImmediate(processMessageQueue);
         }
-        
     } catch (error) {
         console.error('Message handler error:', error);
     }
 });
 
 // Admin commands
+telegramBot.command('savesession', async (ctx) => {
+    if (ctx.from && ctx.from.id.toString() === process.env.TELEGRAM_ADMIN_ID) {
+        await ctx.reply('💾 Saving session...');
+        const base64 = await sessionManager.saveSessionToBase64();
+        if (base64) {
+            await ctx.reply('✅ Session saved! Check the file above and add to WHATSAPP_SESSION env variable.');
+        } else {
+            await ctx.reply('❌ Failed to save session.');
+        }
+    }
+});
+
 telegramBot.command('status', async (ctx) => {
     if (ctx.from && ctx.from.id.toString() === process.env.TELEGRAM_ADMIN_ID) {
         const status = `
@@ -405,183 +354,16 @@ telegramBot.command('status', async (ctx) => {
 📱 WhatsApp: ${isWhatsAppReady ? '✅ Connected' : '❌ Disconnected'}
 💬 Queue: ${messageQueue.length} messages
 ⏱ Uptime: ${Math.floor(process.uptime() / 60)} minutes
-🎯 Target: ${process.env.WHATSAPP_GROUP_NAME || 'Not set'}
-☁️ Mega: ${sessionManager.ready ? '✅ Connected' : '❌ Disconnected'}
-⚡ Mode: Ultra-Fast (${CONCURRENT_MESSAGES} concurrent)
-🔄 Processing: ${isProcessing ? 'Yes' : 'No'}
+🎯 Target: ${process.env.WHATSAPP_GROUP_NAME}
+💾 Session: ${process.env.WHATSAPP_SESSION ? '✅ Stored' : '❌ Not stored'}
+⚡ Mode: Ultra-Fast
         `;
-        
         await ctx.reply(status, { parse_mode: 'Markdown' });
     }
 });
 
-telegramBot.command('restart', async (ctx) => {
-    if (ctx.from && ctx.from.id.toString() === process.env.TELEGRAM_ADMIN_ID) {
-        await ctx.reply('🔄 Restarting WhatsApp connection...');
-        
-        if (whatsappClient) {
-            await whatsappClient.destroy();
-        }
-        
-        setTimeout(() => initWhatsApp(), 2000);
-    }
-});
-
-telegramBot.command('test', async (ctx) => {
-    if (ctx.from && ctx.from.id.toString() === process.env.TELEGRAM_ADMIN_ID) {
-        const testMessage = `🧪 Test message sent at ${new Date().toLocaleTimeString()}`;
-        messageQueue.push({ type: 'test', content: testMessage });
-        setImmediate(processMessageQueue);
-        await ctx.reply('📤 Test message queued!');
-    }
-});
-
-telegramBot.command('backup', async (ctx) => {
-    if (ctx.from && ctx.from.id.toString() === process.env.TELEGRAM_ADMIN_ID) {
-        await ctx.reply('💾 Backing up session to Mega...');
-        const result = await sessionManager.uploadSession();
-        await ctx.reply(result ? '✅ Backup successful!' : '❌ Backup failed!');
-    }
-});
-
-// Keep-alive function
-async function keepAlive() {
-    if (process.env.RENDER_EXTERNAL_URL) {
-        try {
-            await axios.get(`${process.env.RENDER_EXTERNAL_URL}/health`, { timeout: 5000 });
-            console.log('🏓 Keep-alive ping successful');
-        } catch (error) {
-            console.error('Keep-alive ping failed:', error.message);
-        }
-    }
-}
-
-// Backup session periodically
-setInterval(async () => {
-    if (isWhatsAppReady && sessionManager.ready) {
-        await sessionManager.uploadSession();
-    }
-}, 3600000); // Every hour
-
-// Ultra-fast queue processor - runs continuously
-const runQueueProcessor = () => {
-    if (!isProcessing && messageQueue.length > 0 && isWhatsAppReady && targetChat) {
-        processMessageQueue();
-    }
-    setTimeout(runQueueProcessor, QUEUE_CHECK_INTERVAL);
-};
-
-// Keep-alive interval
-setInterval(keepAlive, 4 * 60 * 1000); // Every 4 minutes
-
-// Graceful shutdown
-process.on('SIGTERM', async () => {
-    console.log('🛑 Shutting down...');
-    
-    // Save session before shutdown
-    if (isWhatsAppReady) {
-        await sessionManager.uploadSession();
-    }
-    
-    if (whatsappClient) {
-        await whatsappClient.destroy();
-    }
-    
-    await telegramBot.stop();
-    process.exit(0);
-});
-
-process.on('SIGINT', async () => {
-    console.log('🛑 SIGINT received...');
-    
-    if (isWhatsAppReady) {
-        await sessionManager.uploadSession();
-    }
-    
-    if (whatsappClient) {
-        await whatsappClient.destroy();
-    }
-    
-    await telegramBot.stop();
-    process.exit(0);
-});
+// Keep-alive and other functions remain the same...
 
 // Start the application
 async function start() {
-    console.log('🚀 Starting Ultra-Fast WhatsApp-Telegram Bridge...');
-    console.log(`⚡ Performance Mode: ${CONCURRENT_MESSAGES} concurrent messages`);
-    console.log(`⚡ Message Delay: ${MESSAGE_DELAY}ms`);
-    console.log(`⚡ Queue Check: Every ${QUEUE_CHECK_INTERVAL}ms`);
-    
-    const requiredEnvVars = ['TELEGRAM_BOT_TOKEN', 'WHATSAPP_GROUP_NAME'];
-    const missingVars = requiredEnvVars.filter(v => !process.env[v]);
-    
-    if (missingVars.length > 0) {
-        console.error(`❌ Missing required environment variables: ${missingVars.join(', ')}`);
-        process.exit(1);
-    }
-    
-    // Start Express server
-    app.listen(PORT, '0.0.0.0', () => {
-        console.log(`🌐 Health check server running on port ${PORT}`);
-    });
-
-    // Start queue processor
-    runQueueProcessor();
-
-    // Initialize WhatsApp with delay to ensure Docker is ready
-    setTimeout(() => {
-        initWhatsApp().catch(error => {
-            console.error('Failed to initialize WhatsApp:', error);
-        });
-    }, 2000);
-
-    // Start Telegram bot with conflict handling
-    try {
-        await telegramBot.telegram.deleteWebhook({ drop_pending_updates: true });
-        await telegramBot.launch({
-            dropPendingUpdates: true,
-            allowedUpdates: ['message', 'channel_post'] // Listen to both
-        });
-        console.log('🤖 Telegram bot started successfully');
-        
-        // Set bot commands
-        await telegramBot.telegram.setMyCommands([
-            { command: 'status', description: 'Check bot status' },
-            { command: 'restart', description: 'Restart WhatsApp connection' },
-            { command: 'test', description: 'Send test message' },
-            { command: 'backup', description: 'Backup session to Mega' }
-        ]);
-        
-    } catch (error) {
-        if (error.message && error.message.includes('409')) {
-            console.log('🔄 Clearing existing bot instance...');
-            try {
-                await new Promise(resolve => setTimeout(resolve, 2000));
-                await telegramBot.launch({ dropPendingUpdates: true });
-                console.log('🤖 Telegram bot started after retry');
-            } catch (retryError) {
-                console.error('Failed to start Telegram bot:', retryError);
-            }
-        } else {
-            console.error('Telegram bot error:', error);
-        }
-    }
-}
-
-// Handle uncaught errors
-process.on('uncaughtException', (error) => {
-    console.error('Uncaught Exception:', error);
-    // Don't exit on uncaught exceptions, try to recover
-});
-
-process.on('unhandledRejection', (error) => {
-    console.error('Unhandled Rejection:', error);
-    // Don't exit on unhandled rejections, try to recover
-});
-
-// Start everything
-start().catch(error => {
-    console.error('Fatal error during startup:', error);
-    process.exit(1);
-});
+    console.

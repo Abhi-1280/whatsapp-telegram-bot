@@ -1,6 +1,7 @@
 {
   "name": "whatsapp-telegram-forwarder",
-  "version": "2.0.0",
+  "version": "3.0.0",
+  "description": "Ultra-fast WhatsApp-Telegram message forwarder",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"

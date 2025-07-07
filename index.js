@@ -304,6 +304,8 @@ bot.on('channel_post', async (ctx) => {
                     caption: text
                 });
                 console.log(`✅ Photo sent in ${Date.now() - startTime}ms`);
+            })
+            // Continuing from where I left off...
             }).catch(console.error);
             
         } else if (post.video) {
@@ -343,7 +345,6 @@ bot.on('channel_post', async (ctx) => {
 });
 
 // Bot commands
-// Bot commands (continued)
 bot.command('status', async (ctx) => {
     if (ctx.from.id.toString() !== ADMIN_ID) return;
     
@@ -442,7 +443,6 @@ const keepAlive = () => {
     }, 5 * 60 * 1000); // 5 minutes
     
     // More aggressive ping for first 30 minutes
-        // More aggressive ping for first 30 minutes
     const aggressivePing = setInterval(async () => {
         if (process.env.RENDER_EXTERNAL_URL) {
             try {
@@ -458,7 +458,13 @@ const keepAlive = () => {
 // Error handling
 process.on('uncaughtException', (error) => {
     console.error('Uncaught Exception:', error);
-    if (ADMIN_ID && bot) {
+    // Don't send Telegram messages during startup errors
+    if (error.code === 'EADDRINUSE') {
+        console.error('Port already in use, this is likely a Render deployment issue');
+        // Don't exit on port errors during deployment
+        return;
+    }
+    if (ADMIN_ID && bot && isReady) {
         bot.telegram.sendMessage(ADMIN_ID, `⚠️ Error: ${error.message}\nRestarting...`).catch(() => {});
     }
     setTimeout(() => process.exit(1), 1000);
@@ -475,16 +481,9 @@ async function startBot() {
     console.log(`💾 Session: ${SESSION_DATA ? 'Found' : 'Not set'}`);
     
     try {
-        // Launch Telegram bot
+        // Launch Telegram bot with polling (more reliable than webhook)
         await bot.launch({
-            webhook: {
-                domain: process.env.RENDER_EXTERNAL_URL,
-                port: PORT
-            }
-        }).catch(async () => {
-            // Fallback to polling if webhook fails
-            console.log('Webhook failed, using polling mode');
-            await bot.launch();
+            allowedUpdates: ['message', 'channel_post', 'callback_query']
         });
         
         console.log('✅ Telegram bot started');

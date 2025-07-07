@@ -26,10 +26,10 @@ let targetChat = null;
 const messageQueue = [];
 let isProcessing = false;
 
-// Performance settings for deals
-const CONCURRENT_MESSAGES = 5;
-const MESSAGE_DELAY = 50;
-const QUEUE_CHECK_INTERVAL = 100;
+// Performance settings for deals - OPTIMIZED
+const CONCURRENT_MESSAGES = 10; // Increased for faster processing
+const MESSAGE_DELAY = 25; // Reduced delay
+const QUEUE_CHECK_INTERVAL = 50; // Faster queue checking
 
 // Mega storage for session persistence
 let megaStorage = null;
@@ -239,26 +239,40 @@ async function initWhatsApp() {
         await sessionManager.uploadSession();
         
         const chats = await whatsappClient.getChats();
-        targetChat = chats.find(chat => chat.name === process.env.WHATSAPP_GROUP_NAME);
+        
+        // Debug: List all chats
+        console.log('📋 Available chats:');
+        chats.forEach(chat => {
+            console.log(`- ${chat.name} (${chat.isGroup ? 'Group' : 'Contact'})`);
+        });
+        
+        // Find target chat - case insensitive search
+        targetChat = chats.find(chat => 
+            chat.name && chat.name.toLowerCase() === process.env.WHATSAPP_GROUP_NAME.toLowerCase()
+        );
         
         if (targetChat) {
             console.log(`✅ Found target group: ${process.env.WHATSAPP_GROUP_NAME}`);
+            console.log(`   Group ID: ${targetChat.id._serialized}`);
             
             if (process.env.TELEGRAM_ADMIN_ID) {
                 await telegramBot.telegram.sendMessage(
                     process.env.TELEGRAM_ADMIN_ID,
-                    `✅ *Bot is ready!*\n\n📱 WhatsApp: Connected\n👥 Target Group: ${process.env.WHATSAPP_GROUP_NAME}\n☁️ Session: Backed up to Mega\n🚀 Ultra-fast mode enabled!`,
+                    `✅ *Bot is ready!*\n\n📱 WhatsApp: Connected\n👥 Target Group: ${process.env.WHATSAPP_GROUP_NAME}\n☁️ Session: Backed up to Mega\n🚀 Ultra-fast mode enabled!\n\n📨 Send a message to your Telegram channel to test!`,
                     { parse_mode: 'Markdown' }
                 );
             }
         } else {
             console.error(`❌ Target group not found: ${process.env.WHATSAPP_GROUP_NAME}`);
+            console.error('Make sure the group name is EXACT (case-sensitive)');
             
-            // List available chats
-            console.log('Available chats:');
-            chats.forEach(chat => {
-                console.log(`- ${chat.name} (${chat.isGroup ? 'Group' : 'Contact'})`);
-            });
+            if (process.env.TELEGRAM_ADMIN_ID) {
+                await telegramBot.telegram.sendMessage(
+                    process.env.TELEGRAM_ADMIN_ID,
+                    `❌ *Error: WhatsApp group not found!*\n\nLooking for: "${process.env.WHATSAPP_GROUP_NAME}"\n\nAvailable groups:\n${chats.filter(c => c.isGroup).map(c => `• ${c.name}`).join('\n')}\n\n⚠️ Check the exact group name in Render settings!`,
+                    { parse_mode: 'Markdown' }
+                );
+            }
         }
     });
 
@@ -266,6 +280,7 @@ async function initWhatsApp() {
     whatsappClient.on('disconnected', (reason) => {
         console.log('❌ WhatsApp disconnected:', reason);
         isWhatsAppReady = false;
+        targetChat = null;
         
         setTimeout(() => {
             console.log('🔄 Reconnecting...');
@@ -290,37 +305,52 @@ async function processMessageQueue() {
 
     isProcessing = true;
 
+    // Process all messages at once for maximum speed
     const messagesToProcess = messageQueue.splice(0, CONCURRENT_MESSAGES);
     
     try {
-        await Promise.all(
-            messagesToProcess.map(async (message) => {
-                try {
-                    await targetChat.sendMessage(message.content);
-                    console.log(`⚡ Sent: ${message.type}`);
-                } catch (error) {
-                    console.error(`❌ Failed: ${error.message}`);
-                }
-            })
-        );
+        // Send all messages in parallel
+        const sendPromises = messagesToProcess.map(async (message, index) => {
+            try {
+                // Add small stagger to avoid rate limiting
+                await new Promise(resolve => setTimeout(resolve, index * 10));
+                await targetChat.sendMessage(message.content);
+                console.log(`⚡ Sent [${index + 1}/${messagesToProcess.length}]: ${message.type} - ${message.content.substring(0, 50)}...`);
+                return true;
+            } catch (error) {
+                console.error(`❌ Failed to send message: ${error.message}`);
+                return false;
+            }
+        });
         
-        if (messageQueue.length > 0) {
-            await new Promise(resolve => setTimeout(resolve, MESSAGE_DELAY));
-        }
+        await Promise.all(sendPromises);
+        
     } catch (error) {
         console.error('Batch send error:', error);
     }
 
     isProcessing = false;
     
+    // Immediately check for more messages
     if (messageQueue.length > 0) {
         setImmediate(processMessageQueue);
     }
 }
 
-// Telegram message handler - Ultra fast
-telegramBot.on('channel_post', async (ctx) => {
-    const message = ctx.channelPost;
+// Fixed Telegram message handler
+telegramBot.on(['message', 'channel_post'], async (ctx) => {
+    // Handle both direct messages and channel posts
+    const message = ctx.message || ctx.channelPost;
+    
+    if (!message) return;
+    
+    console.log(`📨 Received Telegram message: ${message.text || 'media'}`);
+    
+    // Check if WhatsApp is ready
+    if (!isWhatsAppReady || !targetChat) {
+        console.log('⚠️ WhatsApp not ready or target chat not found');
+        return;
+    }
     
     try {
         let content = '';
@@ -329,19 +359,35 @@ telegramBot.on('channel_post', async (ctx) => {
         if (message.text) {
             content = message.text;
             type = 'text';
-        } else if (message.photo) {
-            content = `📸 ${message.caption || ''}`.trim();
+                } else if (message.photo) {
+            const caption = message.caption || '';
+            content = `📸 Photo${caption ? ': ' + caption : ''}`;
             type = 'photo';
         } else if (message.video) {
-            content = `🎥 ${message.caption || ''}`.trim();
+            const caption = message.caption || '';
+            content = `🎥 Video${caption ? ': ' + caption : ''}`;
             type = 'video';
         } else if (message.document) {
-            content = `📎 ${message.document.file_name}\n${message.caption || ''}`.trim();
+            const fileName = message.document.file_name;
+            const caption = message.caption || '';
+            content = `📎 File: ${fileName}${caption ? '\n' + caption : ''}`;
             type = 'document';
+        } else if (message.sticker) {
+            content = `🎭 Sticker${message.sticker.emoji ? ': ' + message.sticker.emoji : ''}`;
+            type = 'sticker';
+        } else if (message.voice) {
+            content = `🎤 Voice message (${message.voice.duration}s)`;
+            type = 'voice';
+        } else if (message.poll) {
+            content = `📊 Poll: ${message.poll.question}\nOptions: ${message.poll.options.map(o => o.text).join(', ')}`;
+            type = 'poll';
         }
         
         if (content) {
+            console.log(`📥 Adding to queue: ${type} - ${content.substring(0, 50)}...`);
             messageQueue.push({ type, content });
+            
+            // Immediately trigger processing
             setImmediate(processMessageQueue);
         }
         
@@ -359,9 +405,10 @@ telegramBot.command('status', async (ctx) => {
 📱 WhatsApp: ${isWhatsAppReady ? '✅ Connected' : '❌ Disconnected'}
 💬 Queue: ${messageQueue.length} messages
 ⏱ Uptime: ${Math.floor(process.uptime() / 60)} minutes
-🎯 Target: ${process.env.WHATSAPP_GROUP_NAME}
+🎯 Target: ${process.env.WHATSAPP_GROUP_NAME || 'Not set'}
 ☁️ Mega: ${sessionManager.ready ? '✅ Connected' : '❌ Disconnected'}
-⚡ Mode: Ultra-Fast
+⚡ Mode: Ultra-Fast (${CONCURRENT_MESSAGES} concurrent)
+🔄 Processing: ${isProcessing ? 'Yes' : 'No'}
         `;
         
         await ctx.reply(status, { parse_mode: 'Markdown' });
@@ -380,11 +427,28 @@ telegramBot.command('restart', async (ctx) => {
     }
 });
 
+telegramBot.command('test', async (ctx) => {
+    if (ctx.from && ctx.from.id.toString() === process.env.TELEGRAM_ADMIN_ID) {
+        const testMessage = `🧪 Test message sent at ${new Date().toLocaleTimeString()}`;
+        messageQueue.push({ type: 'test', content: testMessage });
+        setImmediate(processMessageQueue);
+        await ctx.reply('📤 Test message queued!');
+    }
+});
+
+telegramBot.command('backup', async (ctx) => {
+    if (ctx.from && ctx.from.id.toString() === process.env.TELEGRAM_ADMIN_ID) {
+        await ctx.reply('💾 Backing up session to Mega...');
+        const result = await sessionManager.uploadSession();
+        await ctx.reply(result ? '✅ Backup successful!' : '❌ Backup failed!');
+    }
+});
+
 // Keep-alive function
 async function keepAlive() {
     if (process.env.RENDER_EXTERNAL_URL) {
         try {
-            await axios.get(`${process.env.RENDER_EXTERNAL_URL}/health`);
+            await axios.get(`${process.env.RENDER_EXTERNAL_URL}/health`, { timeout: 5000 });
             console.log('🏓 Keep-alive ping successful');
         } catch (error) {
             console.error('Keep-alive ping failed:', error.message);
@@ -394,17 +458,18 @@ async function keepAlive() {
 
 // Backup session periodically
 setInterval(async () => {
-    if (isWhatsAppReady) {
+    if (isWhatsAppReady && sessionManager.ready) {
         await sessionManager.uploadSession();
     }
 }, 3600000); // Every hour
 
-// Ultra-fast queue processor
-setInterval(() => {
-    if (!isProcessing && messageQueue.length > 0) {
+// Ultra-fast queue processor - runs continuously
+const runQueueProcessor = () => {
+    if (!isProcessing && messageQueue.length > 0 && isWhatsAppReady && targetChat) {
         processMessageQueue();
     }
-}, QUEUE_CHECK_INTERVAL);
+    setTimeout(runQueueProcessor, QUEUE_CHECK_INTERVAL);
+};
 
 // Keep-alive interval
 setInterval(keepAlive, 4 * 60 * 1000); // Every 4 minutes
@@ -438,7 +503,7 @@ process.on('SIGINT', async () => {
     }
     
     await telegramBot.stop();
-        process.exit(0);
+    process.exit(0);
 });
 
 // Start the application
@@ -446,6 +511,7 @@ async function start() {
     console.log('🚀 Starting Ultra-Fast WhatsApp-Telegram Bridge...');
     console.log(`⚡ Performance Mode: ${CONCURRENT_MESSAGES} concurrent messages`);
     console.log(`⚡ Message Delay: ${MESSAGE_DELAY}ms`);
+    console.log(`⚡ Queue Check: Every ${QUEUE_CHECK_INTERVAL}ms`);
     
     const requiredEnvVars = ['TELEGRAM_BOT_TOKEN', 'WHATSAPP_GROUP_NAME'];
     const missingVars = requiredEnvVars.filter(v => !process.env[v]);
@@ -460,6 +526,9 @@ async function start() {
         console.log(`🌐 Health check server running on port ${PORT}`);
     });
 
+    // Start queue processor
+    runQueueProcessor();
+
     // Initialize WhatsApp with delay to ensure Docker is ready
     setTimeout(() => {
         initWhatsApp().catch(error => {
@@ -471,9 +540,19 @@ async function start() {
     try {
         await telegramBot.telegram.deleteWebhook({ drop_pending_updates: true });
         await telegramBot.launch({
-            dropPendingUpdates: true
+            dropPendingUpdates: true,
+            allowedUpdates: ['message', 'channel_post'] // Listen to both
         });
         console.log('🤖 Telegram bot started successfully');
+        
+        // Set bot commands
+        await telegramBot.telegram.setMyCommands([
+            { command: 'status', description: 'Check bot status' },
+            { command: 'restart', description: 'Restart WhatsApp connection' },
+            { command: 'test', description: 'Send test message' },
+            { command: 'backup', description: 'Backup session to Mega' }
+        ]);
+        
     } catch (error) {
         if (error.message && error.message.includes('409')) {
             console.log('🔄 Clearing existing bot instance...');

@@ -298,37 +298,32 @@ bot.on('channel_post', async (ctx) => {
         if (post.photo) {
             // Download and send photo
             const photoId = post.photo[post.photo.length - 1].file_id;
-            downloadFile(photoId).then(async (buffer) => {
-                await sock.sendMessage(targetGroupId, {
-                    image: buffer,
-                    caption: text
-                });
-                console.log(`✅ Photo sent in ${Date.now() - startTime}ms`);
-            })
-            // Continuing from where I left off...
-            }).catch(console.error);
+            const buffer = await downloadFile(photoId);
+            await sock.sendMessage(targetGroupId, {
+                image: buffer,
+                caption: text
+            });
+            console.log(`✅ Photo sent in ${Date.now() - startTime}ms`);
             
         } else if (post.video) {
             // Download and send video
-            downloadFile(post.video.file_id).then(async (buffer) => {
-                await sock.sendMessage(targetGroupId, {
-                    video: buffer,
-                    caption: text
-                });
-                console.log(`✅ Video sent in ${Date.now() - startTime}ms`);
-            }).catch(console.error);
+            const buffer = await downloadFile(post.video.file_id);
+            await sock.sendMessage(targetGroupId, {
+                video: buffer,
+                caption: text
+            });
+            console.log(`✅ Video sent in ${Date.now() - startTime}ms`);
             
         } else if (post.document) {
             // Download and send document
-            downloadFile(post.document.file_id).then(async (buffer) => {
-                await sock.sendMessage(targetGroupId, {
-                    document: buffer,
-                    mimetype: post.document.mime_type,
-                    fileName: post.document.file_name,
-                    caption: text
-                });
-                console.log(`✅ Document sent in ${Date.now() - startTime}ms`);
-            }).catch(console.error);
+            const buffer = await downloadFile(post.document.file_id);
+            await sock.sendMessage(targetGroupId, {
+                document: buffer,
+                mimetype: post.document.mime_type,
+                fileName: post.document.file_name,
+                caption: text
+            });
+            console.log(`✅ Document sent in ${Date.now() - startTime}ms`);
             
         } else if (text) {
             // Send text message

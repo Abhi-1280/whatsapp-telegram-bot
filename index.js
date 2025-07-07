@@ -8,6 +8,7 @@ const path = require('path');
 const { Storage } = require('megajs');
 const archiver = require('archiver');
 const extract = require('extract-zip');
+const axios = require('axios');
 
 // Express app for health checks
 const app = express();
@@ -175,6 +176,9 @@ const sessionManager = new SessionManager();
 async function initWhatsApp() {
     console.log('🔄 Initializing WhatsApp...');
     
+    // Initialize session manager
+    await sessionManager.init();
+    
     // Download session from Mega if available
     await sessionManager.downloadSession();
     
@@ -249,6 +253,12 @@ async function initWhatsApp() {
             }
         } else {
             console.error(`❌ Target group not found: ${process.env.WHATSAPP_GROUP_NAME}`);
+            
+            // List available chats
+            console.log('Available chats:');
+            chats.forEach(chat => {
+                console.log(`- ${chat.name} (${chat.isGroup ? 'Group' : 'Contact'})`);
+            });
         }
     });
 
@@ -358,6 +368,30 @@ telegramBot.command('status', async (ctx) => {
     }
 });
 
+telegramBot.command('restart', async (ctx) => {
+    if (ctx.from && ctx.from.id.toString() === process.env.TELEGRAM_ADMIN_ID) {
+        await ctx.reply('🔄 Restarting WhatsApp connection...');
+        
+        if (whatsappClient) {
+            await whatsappClient.destroy();
+        }
+        
+        setTimeout(() => initWhatsApp(), 2000);
+    }
+});
+
+// Keep-alive function
+async function keepAlive() {
+    if (process.env.RENDER_EXTERNAL_URL) {
+        try {
+            await axios.get(`${process.env.RENDER_EXTERNAL_URL}/health`);
+            console.log('🏓 Keep-alive ping successful');
+        } catch (error) {
+            console.error('Keep-alive ping failed:', error.message);
+        }
+    }
+}
+
 // Backup session periodically
 setInterval(async () => {
     if (isWhatsAppReady) {
@@ -371,6 +405,9 @@ setInterval(() => {
         processMessageQueue();
     }
 }, QUEUE_CHECK_INTERVAL);
+
+// Keep-alive interval
+setInterval(keepAlive, 4 * 60 * 1000); // Every 4 minutes
 
 // Graceful shutdown
 process.on('SIGTERM', async () => {
@@ -389,9 +426,26 @@ process.on('SIGTERM', async () => {
     process.exit(0);
 });
 
+process.on('SIGINT', async () => {
+    console.log('🛑 SIGINT received...');
+    
+    if (isWhatsAppReady) {
+        await sessionManager.uploadSession();
+    }
+    
+    if (whatsappClient) {
+        await whatsappClient.destroy();
+    }
+    
+    await telegramBot.stop();
+        process.exit(0);
+});
+
 // Start the application
 async function start() {
     console.log('🚀 Starting Ultra-Fast WhatsApp-Telegram Bridge...');
+    console.log(`⚡ Performance Mode: ${CONCURRENT_MESSAGES} concurrent messages`);
+    console.log(`⚡ Message Delay: ${MESSAGE_DELAY}ms`);
     
     const requiredEnvVars = ['TELEGRAM_BOT_TOKEN', 'WHATSAPP_GROUP_NAME'];
     const missingVars = requiredEnvVars.filter(v => !process.env[v]);
@@ -401,4 +455,54 @@ async function start() {
         process.exit(1);
     }
     
-    //
+    // Start Express server
+    app.listen(PORT, '0.0.0.0', () => {
+        console.log(`🌐 Health check server running on port ${PORT}`);
+    });
+
+    // Initialize WhatsApp with delay to ensure Docker is ready
+    setTimeout(() => {
+        initWhatsApp().catch(error => {
+            console.error('Failed to initialize WhatsApp:', error);
+        });
+    }, 2000);
+
+    // Start Telegram bot with conflict handling
+    try {
+        await telegramBot.telegram.deleteWebhook({ drop_pending_updates: true });
+        await telegramBot.launch({
+            dropPendingUpdates: true
+        });
+        console.log('🤖 Telegram bot started successfully');
+    } catch (error) {
+        if (error.message && error.message.includes('409')) {
+            console.log('🔄 Clearing existing bot instance...');
+            try {
+                await new Promise(resolve => setTimeout(resolve, 2000));
+                await telegramBot.launch({ dropPendingUpdates: true });
+                console.log('🤖 Telegram bot started after retry');
+            } catch (retryError) {
+                console.error('Failed to start Telegram bot:', retryError);
+            }
+        } else {
+            console.error('Telegram bot error:', error);
+        }
+    }
+}
+
+// Handle uncaught errors
+process.on('uncaughtException', (error) => {
+    console.error('Uncaught Exception:', error);
+    // Don't exit on uncaught exceptions, try to recover
+});
+
+process.on('unhandledRejection', (error) => {
+    console.error('Unhandled Rejection:', error);
+    // Don't exit on unhandled rejections, try to recover
+});
+
+// Start everything
+start().catch(error => {
+    console.error('Fatal error during startup:', error);
+    process.exit(1);
+});

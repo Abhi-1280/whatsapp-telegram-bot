@@ -4,7 +4,6 @@ const express = require('express');
 const { Storage } = require('megajs');
 const fs = require('fs');
 const fsPromises = require('fs').promises;
-const path = require('path');
 const axios = require('axios');
 const qrcode = require('qrcode-terminal');
 const archiver = require('archiver');
@@ -12,13 +11,36 @@ const unzipper = require('unzipper');
 
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const ADMIN_ID = process.env.TELEGRAM_ADMIN_ID;
-const WHATSAPP_GROUP_NAME = process.env.WHATSAPP_GROUP_NAME || process.env.WHATSAPP_group_NAME;
+const WHATSAPP_GROUP_NAME = 'savings safari'; // Hardcoded group name
 const MEGA_EMAIL = process.env.MEGA_EMAIL;
 const MEGA_PASSWORD = process.env.MEGA_PASSWORD;
 const PORT = process.env.PORT || 3000;
 
-const bot = new Telegraf(BOT_TOKEN);
+// Initialize Express immediately
 const app = express();
+app.use(express.json());
+
+// Start server first for Render
+app.get('/', (req, res) => {
+    res.json({
+        status: 'running',
+        whatsapp: isReady,
+        group: whatsappGroupId ? 'found' : 'not_found',
+        queue: messageQueue.length,
+        uptime: Math.floor(process.uptime())
+    });
+});
+
+app.get('/health', (req, res) => {
+    res.status(200).send('OK');
+});
+
+const server = app.listen(PORT, '0.0.0.0', () => {
+    console.log(`Server running on port ${PORT}`);
+});
+
+// Initialize variables
+const bot = new Telegraf(BOT_TOKEN);
 let whatsappClient;
 let isReady = false;
 let whatsappGroupId = null;
@@ -29,10 +51,7 @@ let isProcessing = false;
 const AXIOS_INSTANCE = axios.create({
     timeout: 30000,
     maxContentLength: 100 * 1024 * 1024,
-    maxBodyLength: 100 * 1024 * 1024,
-    headers: {
-        'Connection': 'keep-alive'
-    }
+    maxBodyLength: 100 * 1024 * 1024
 });
 
 const ensureDirectoryExists = async (dirPath) => {
@@ -47,7 +66,8 @@ const initMega = async () => {
     try {
         megaStorage = new Storage({
             email: MEGA_EMAIL,
-            password: MEGA_PASSWORD
+            password: MEGA_PASSWORD,
+            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         });
         await megaStorage.ready;
         console.log('Mega storage connected');
@@ -68,7 +88,7 @@ const downloadSessionFromMega = async () => {
         const sessionFile = files.find(file => file.name === 'wa-session.zip');
         
         if (sessionFile) {
-            console.log('Found session in Mega, downloading...');
+            console.log('Downloading session from Mega...');
             const buffer = await sessionFile.downloadBuffer();
             await fsPromises.writeFile('./wa-session.zip', buffer);
             
@@ -80,7 +100,7 @@ const downloadSessionFromMega = async () => {
             });
             
             await fsPromises.unlink('./wa-session.zip').catch(() => {});
-            console.log('Session restored from Mega');
+            console.log('Session restored successfully');
             return true;
         }
         console.log('No session found in Mega');
@@ -126,15 +146,16 @@ const uploadSessionToMega = async () => {
         await fsPromises.unlink('./wa-session.zip').catch(() => {});
         console.log('Session backed up to Mega');
     } catch (error) {
-        console.error('Session upload error:', error);
+        console.error('Backup error:', error);
     }
 };
 
 const initWhatsApp = async () => {
+    console.log('Initializing WhatsApp...');
+    
     whatsappClient = new Client({
         authStrategy: new LocalAuth({
-            clientId: "fast-forwarder",
-            dataPath: "./.wwebjs_auth"
+            clientId: "bot-client"
         }),
         puppeteer: {
             headless: true,
@@ -147,69 +168,82 @@ const initWhatsApp = async () => {
                 '--no-zygote',
                 '--single-process',
                 '--disable-gpu'
-            ],
-            timeout: 60000
+            ]
         }
     });
 
     whatsappClient.on('qr', (qr) => {
-        console.log('QR Code received');
+        console.log('QR RECEIVED - Scan this code:');
         qrcode.generate(qr, { small: true });
-        bot.telegram.sendMessage(ADMIN_ID, `📱 Please scan this QR code to login WhatsApp Web`);
+        if (ADMIN_ID) {
+            bot.telegram.sendMessage(ADMIN_ID, '📱 Please scan the QR code in the console logs');
+        }
     });
 
     whatsappClient.on('authenticated', () => {
-        console.log('WhatsApp authenticated successfully');
-        setTimeout(() => uploadSessionToMega(), 10000);
+        console.log('Authenticated!');
+        setTimeout(uploadSessionToMega, 10000);
     });
 
     whatsappClient.on('ready', async () => {
-        console.log('WhatsApp client is ready');
+        console.log('WhatsApp is ready!');
         isReady = true;
         
         try {
             const chats = await whatsappClient.getChats();
-            const targetGroup = chats.find(chat => 
-                chat.isGroup && chat.name.toLowerCase().includes(WHATSAPP_GROUP_NAME.toLowerCase())
+            const group = chats.find(chat => 
+                chat.isGroup && chat.name.toLowerCase() === WHATSAPP_GROUP_NAME.toLowerCase()
             );
             
-            if (targetGroup) {
-                whatsappGroupId = targetGroup.id._serialized;
-                console.log(`Found WhatsApp group: ${targetGroup.name}`);
-                bot.telegram.sendMessage(ADMIN_ID, 
-                    `✅ Bot is ready!\n` +
-                    `📱 WhatsApp: Connected\n` +
-                    `👥 Group: ${targetGroup.name}\n` +
-                    `⚡ Mode: Ultra-fast forwarding active`
-                );
+            if (group) {
+                whatsappGroupId = group.id._serialized;
+                console.log(`Found group: ${group.name}`);
                 
+                if (ADMIN_ID) {
+                    await bot.telegram.sendMessage(ADMIN_ID, 
+                        `✅ Bot Ready!\n` +
+                        `📱 WhatsApp: Connected\n` +
+                        `👥 Group: ${group.name}\n` +
+                        `📨 Queue: ${messageQueue.length} messages`
+                    );
+                }
+                
+                // Process queued messages
                 processQueue();
             } else {
-                bot.telegram.sendMessage(ADMIN_ID, 
-                    `❌ Group "${WHATSAPP_GROUP_NAME}" not found\n` +
-                    `Available groups:\n${chats.filter(c => c.isGroup).map(c => c.name).join('\n')}`
-                );
+                console.log(`Group "${WHATSAPP_GROUP_NAME}" not found`);
+                if (ADMIN_ID) {
+                    const groupList = chats
+                        .filter(c => c.isGroup)
+                        .map(c => c.name)
+                        .slice(0, 10)
+                        .join('\n');
+                    
+                    await bot.telegram.sendMessage(ADMIN_ID, 
+                        `❌ Group "${WHATSAPP_GROUP_NAME}" not found\n\n` +
+                        `Available groups:\n${groupList}`
+                    );
+                }
             }
         } catch (error) {
-            console.error('Error finding group:', error);
-            bot.telegram.sendMessage(ADMIN_ID, `❌ Error: ${error.message}`);
+            console.error('Error in ready event:', error);
         }
     });
 
     whatsappClient.on('auth_failure', (msg) => {
-        console.error('Authentication failed:', msg);
-        bot.telegram.sendMessage(ADMIN_ID, `❌ WhatsApp authentication failed. Please restart and scan QR again.`);
+        console.error('Auth failed:', msg);
+        if (ADMIN_ID) {
+            bot.telegram.sendMessage(ADMIN_ID, '❌ Authentication failed!');
+        }
     });
 
-    whatsappClient.on('disconnected', async (reason) => {
-        console.log('WhatsApp disconnected:', reason);
+    whatsappClient.on('disconnected', (reason) => {
+        console.log('Disconnected:', reason);
         isReady = false;
-        whatsappGroupId = null;
-        
-        bot.telegram.sendMessage(ADMIN_ID, `⚠️ WhatsApp disconnected: ${reason}\nReconnecting...`);
-        
-        await whatsappClient.destroy();
-        setTimeout(() => initWhatsApp(), 5000);
+        if (ADMIN_ID) {
+            bot.telegram.sendMessage(ADMIN_ID, `⚠️ Disconnected: ${reason}`);
+        }
+        setTimeout(initWhatsApp, 5000);
     });
 
     whatsappClient.initialize();
@@ -221,20 +255,18 @@ const processQueue = async () => {
     isProcessing = true;
     
     while (messageQueue.length > 0 && isReady) {
-        const message = messageQueue.shift();
+        const msg = messageQueue.shift();
         try {
-            await whatsappClient.sendMessage(whatsappGroupId, message.content, message.options);
-            console.log(`Message sent in ${Date.now() - message.timestamp}ms`);
-        } catch (error) {
-            console.error('Error sending message:', error);
-            if (error.message.includes('not found') || error.message.includes('not authorized')) {
-                bot.telegram.sendMessage(ADMIN_ID, `❌ Cannot send to group. Make sure the bot number is admin in the group.`);
+            if (msg.media) {
+                await whatsappClient.sendMessage(whatsappGroupId, msg.media, { caption: msg.caption });
+            } else {
+                await whatsappClient.sendMessage(whatsappGroupId, msg.text);
             }
+            console.log(`Sent queued message (${Date.now() - msg.timestamp}ms old)`);
+        } catch (error) {
+            console.error('Queue send error:', error);
         }
-        
-        if (messageQueue.length > 0) {
-            await new Promise(resolve => setTimeout(resolve, 100));
-        }
+        await new Promise(r => setTimeout(r, 100));
     }
     
     isProcessing = false;
@@ -244,143 +276,91 @@ const downloadFile = async (fileId) => {
     try {
         const file = await bot.telegram.getFile(fileId);
         const url = `https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`;
-        
-        const response = await AXIOS_INSTANCE.get(url, {
-            responseType: 'arraybuffer'
-        });
-        
+        const response = await AXIOS_INSTANCE.get(url, { responseType: 'arraybuffer' });
         return Buffer.from(response.data);
     } catch (error) {
-        console.error('File download error:', error);
+        console.error('Download error:', error);
         throw error;
     }
 };
 
 bot.on('channel_post', async (ctx) => {
     const timestamp = Date.now();
+    const post = ctx.channelPost;
+    const caption = post.text || post.caption || '';
     
     try {
-        const post = ctx.channelPost;
-        const caption = post.text || post.caption || '';
-        
         if (!isReady || !whatsappGroupId) {
-            messageQueue.push({
-                content: caption || 'Forwarded message',
-                options: {},
-                timestamp,
-                post
-            });
+            // Queue the message
+            if (post.photo) {
+                messageQueue.push({ 
+                    text: `[Photo queued] ${caption}`, 
+                    timestamp,
+                    type: 'photo',
+                    fileId: post.photo[post.photo.length - 1].file_id,
+                    caption
+                });
+            } else if (post.video) {
+                messageQueue.push({ 
+                    text: `[Video queued] ${caption}`, 
+                    timestamp,
+                    type: 'video',
+                    fileId: post.video.file_id,
+                    caption
+                });
+            } else if (caption) {
+                messageQueue.push({ text: caption, timestamp });
+            }
             console.log('Message queued (bot not ready)');
             return;
         }
         
+        // Send directly
         if (post.photo) {
-            const photo = post.photo[post.photo.length - 1];
-            downloadFile(photo.file_id).then(async buffer => {
-                const media = new MessageMedia('image/jpeg', buffer.toString('base64'));
-                if (isReady && whatsappGroupId) {
-                    await whatsappClient.sendMessage(whatsappGroupId, media, { caption });
-                    console.log(`Photo sent in ${Date.now() - timestamp}ms`);
-                } else {
-                    messageQueue.push({ content: media, options: { caption }, timestamp });
-                }
-            }).catch(error => {
-                console.error('Photo processing error:', error);
-            });
-            
+            const buffer = await downloadFile(post.photo[post.photo.length - 1].file_id);
+            const media = new MessageMedia('image/jpeg', buffer.toString('base64'));
+            await whatsappClient.sendMessage(whatsappGroupId, media, { caption });
+            console.log(`Photo sent in ${Date.now() - timestamp}ms`);
         } else if (post.video) {
-            downloadFile(post.video.file_id).then(async buffer => {
-                const media = new MessageMedia('video/mp4', buffer.toString('base64'));
-                if (isReady && whatsappGroupId) {
-                    await whatsappClient.sendMessage(whatsappGroupId, media, { caption });
-                    console.log(`Video sent in ${Date.now() - timestamp}ms`);
-                } else {
-                    messageQueue.push({ content: media, options: { caption }, timestamp });
-                }
-            }).catch(error => {
-                console.error('Video processing error:', error);
-            });
-            
+            const buffer = await downloadFile(post.video.file_id);
+            const media = new MessageMedia('video/mp4', buffer.toString('base64'));
+            await whatsappClient.sendMessage(whatsappGroupId, media, { caption });
+            console.log(`Video sent in ${Date.now() - timestamp}ms`);
         } else if (post.document) {
-            downloadFile(post.document.file_id).then(async buffer => {
-                const media = new MessageMedia(
-                    post.document.mime_type || 'application/octet-stream',
-                    buffer.toString('base64'),
-                    post.document.file_name
-                );
-                if (isReady && whatsappGroupId) {
-                    await whatsappClient.sendMessage(whatsappGroupId, media, { caption });
-                    console.log(`Document sent in ${Date.now() - timestamp}ms`);
-                } else {
-                    messageQueue.push({ content: media, options: { caption }, timestamp });
-                }
-            }).catch(error => {
-                console.error('Document processing error:', error);
-            });
-            
+            const buffer = await downloadFile(post.document.file_id);
+            const media = new MessageMedia(
+                post.document.mime_type || 'application/octet-stream',
+                buffer.toString('base64'),
+                post.document.file_name
+            );
+            await whatsappClient.sendMessage(whatsappGroupId, media, { caption });
+            console.log(`Document sent in ${Date.now() - timestamp}ms`);
         } else if (caption) {
-            if (isReady && whatsappGroupId) {
-                await whatsappClient.sendMessage(whatsappGroupId, caption);
-                console.log(`Text sent in ${Date.now() - timestamp}ms`);
-            } else {
-                messageQueue.push({ content: caption, options: {}, timestamp });
-            }
+            await whatsappClient.sendMessage(whatsappGroupId, caption);
+            console.log(`Text sent in ${Date.now() - timestamp}ms`);
         }
-        
     } catch (error) {
-        console.error('Message handling error:', error);
+        console.error('Send error:', error);
     }
 });
 
 bot.command('status', async (ctx) => {
     if (ctx.from.id.toString() !== ADMIN_ID) return;
     
-    const uptime = process.uptime();
-    const hours = Math.floor(uptime / 3600);
-    const minutes = Math.floor((uptime % 3600) / 60);
-    
     await ctx.reply(
-        `⚡ *Ultra-Fast Forwarder Status*\n\n` +
-        `📱 WhatsApp: ${isReady ? '✅ Connected' : '❌ Disconnected'}\n` +
-        `👥 Group: ${whatsappGroupId ? '✅ Found' : '❌ Not found'}\n` +
-        `📨 Queue: ${messageQueue.length} messages\n` +
-        `⏱️ Uptime: ${hours}h ${minutes}m\n` +
-        `🚀 Mode: Lightning Fast`,
-        { parse_mode: 'Markdown' }
+        `📊 Status:\n` +
+        `WhatsApp: ${isReady ? '✅' : '❌'}\n` +
+        `Group: ${whatsappGroupId ? '✅' : '❌'}\n` +
+        `Queue: ${messageQueue.length}\n` +
+        `Server: ✅ Port ${PORT}`
     );
 });
 
 bot.command('restart', async (ctx) => {
     if (ctx.from.id.toString() !== ADMIN_ID) return;
-    
-    await ctx.reply('♻️ Restarting WhatsApp client...');
-    isReady = false;
-    if (whatsappClient) {
-        await whatsappClient.destroy();
-    }
-    setTimeout(() => initWhatsApp(), 2000);
-});
-
-bot.command('backup', async (ctx) => {
-    if (ctx.from.id.toString() !== ADMIN_ID) return;
-    
-    await ctx.reply('💾 Backing up session to Mega...');
-    await uploadSessionToMega();
-    await ctx.reply('✅ Backup completed');
-});
-
-app.get('/', (req, res) => {
-    res.json({
-        status: 'running',
-        whatsapp: isReady,
-        group: whatsappGroupId ? 'found' : 'not_found',
-        queue: messageQueue.length,
-        uptime: Math.floor(process.uptime())
-    });
-});
-
-app.get('/health', (req, res) => {
-    res.status(200).send('OK');
+    await ctx.reply('Restarting...');
+    if (whatsappClient) await whatsappClient.destroy();
+    setTimeout(initWhatsApp, 2000);
 });
 
 const keepAlive = () => {
@@ -394,52 +374,44 @@ const keepAlive = () => {
     }, 4 * 60 * 1000);
 };
 
+// Start everything
 const start = async () => {
-    console.log('Starting Ultra-Fast WhatsApp Forwarder...');
+    console.log('Starting bot...');
     
-    const megaConnected = await initMega();
-    if (megaConnected) {
-        const sessionRestored = await downloadSessionFromMega();
-        console.log(`Session restore: ${sessionRestored ? 'Success' : 'Failed/Not found'}`);
-    }
-    
-    await initWhatsApp();
-    
+    // Launch Telegram bot
     await bot.launch();
     console.log('Telegram bot started');
     
-    app.listen(PORT, '0.0.0.0', () => {
-        console.log(`Express server running on port ${PORT}`);
-    });
+    // Initialize Mega and restore session
+    const megaConnected = await initMega();
+    if (megaConnected) {
+        await downloadSessionFromMega();
+    }
     
+    // Initialize WhatsApp
+    await initWhatsApp();
+    
+    // Start keep-alive
     keepAlive();
     
     if (ADMIN_ID) {
-        bot.telegram.sendMessage(ADMIN_ID, 
-            '🚀 *Ultra-Fast Forwarder Started!*\n\n' +
-            '⚡ Optimized for instant message forwarding\n' +
-            '💾 Session auto-backup enabled\n' +
-            '📱 Waiting for WhatsApp connection...',
-            { parse_mode: 'Markdown' }
-        );
+        bot.telegram.sendMessage(ADMIN_ID, '🚀 Bot started! Initializing WhatsApp...');
     }
 };
 
 process.once('SIGINT', () => {
     bot.stop('SIGINT');
     if (whatsappClient) whatsappClient.destroy();
+    server.close();
     process.exit(0);
 });
 
 process.once('SIGTERM', () => {
     bot.stop('SIGTERM');
     if (whatsappClient) whatsappClient.destroy();
+    server.close();
     process.exit(0);
 });
 
-start().catch(error => {
-    console.error('Failed to start bot:', error);
-    if (ADMIN_ID) {
-        bot.telegram.sendMessage(ADMIN_ID, `❌ Bot failed to start: ${error.message}`);
-    }
-});
+// Start the bot
+start().catch(console.error);

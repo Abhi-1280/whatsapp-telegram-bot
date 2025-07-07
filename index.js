@@ -61,9 +61,8 @@ async function initWhatsApp() {
                 '--disable-features=IsolateOrigins,site-per-process',
                 '--disable-blink-features=AutomationControlled',
                 '--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-            ],
-            // Let puppeteer Docker image handle the Chrome path
-            executablePath: 'google-chrome-stable'
+            ]
+            // Remove executablePath - let whatsapp-web.js handle Chrome detection
         }
     });
 

@@ -1,10 +1,4 @@
-Yes, you can store the session directly! Here's how to implement it using environment variables (most secure approach):
 
-## Option 1: Store Session as Base64 in Environment Variable
-
-Here's the modified code with built-in session storage:
-
-```javascript
 require('dotenv').config();
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const { Telegraf } = require('telegraf');

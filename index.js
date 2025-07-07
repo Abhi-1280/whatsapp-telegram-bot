@@ -1,11 +1,12 @@
-const { Client, LocalAuth } = require('whatsapp-web.js');
+const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
 const { Telegraf } = require('telegraf');
 const express = require('express');
 const { Storage } = require('megajs');
 const fs = require('fs').promises;
-const path = require('path');
 const axios = require('axios');
 const qrcode = require('qrcode-terminal');
+const archiver = require('archiver');
+const unzipper = require('unzipper');
 
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const ADMIN_ID = process.env.TELEGRAM_ADMIN_ID;
@@ -19,21 +20,28 @@ const app = express();
 let whatsappClient;
 let isReady = false;
 let whatsappGroupId = null;
-let messageQueue = [];
-let isProcessing = false;
 let megaStorage;
+let activeDownloads = new Map();
+
+const AXIOS_INSTANCE = axios.create({
+    timeout: 30000,
+    maxContentLength: 100 * 1024 * 1024,
+    maxBodyLength: 100 * 1024 * 1024
+});
 
 const initMega = async () => {
     try {
         megaStorage = new Storage({
             email: MEGA_EMAIL,
-            password: MEGA_PASSWORD
+            password: MEGA_PASSWORD,
+            autologin: true,
+            autoload: true
         });
         await megaStorage.ready;
-        console.log('Mega storage connected');
+        console.log('Mega connected');
         return true;
     } catch (error) {
-        console.error('Mega connection failed:', error);
+        console.error('Mega error:', error);
         return false;
     }
 };
@@ -43,23 +51,23 @@ const downloadSessionFromMega = async () => {
         if (!megaStorage) return false;
         
         const files = await megaStorage.root.children;
-        const sessionFile = files.find(file => file.name === 'whatsapp-session.zip');
+        const sessionFile = files.find(file => file.name === 'wa-session.zip');
         
         if (sessionFile) {
             const buffer = await sessionFile.downloadBuffer();
-            await fs.writeFile('./session-backup.zip', buffer);
+            await fs.writeFile('./wa-session.zip', buffer);
             
-            const unzipper = require('unzipper');
-            await fs.createReadStream('./session-backup.zip')
+            await fs.createReadStream('./wa-session.zip')
                 .pipe(unzipper.Extract({ path: './' }))
                 .promise();
             
-            console.log('Session restored from Mega');
+            await fs.unlink('./wa-session.zip');
+            console.log('Session restored');
             return true;
         }
         return false;
     } catch (error) {
-        console.error('Session download error:', error);
+        console.error('Session restore error:', error);
         return false;
     }
 };
@@ -68,35 +76,66 @@ const uploadSessionToMega = async () => {
     try {
         if (!megaStorage) return;
         
-        const archiver = require('archiver');
-        const output = require('fs').createWriteStream('./session-backup.zip');
-        const archive = archiver('zip', { zlib: { level: 9 } });
+        const output = require('fs').createWriteStream('./wa-session.zip');
+        const archive = archiver('zip', { zlib: { level: 1 } });
         
         output.on('close', async () => {
-            const buffer = await fs.readFile('./session-backup.zip');
+            const buffer = await fs.readFile('./wa-session.zip');
             const files = await megaStorage.root.children;
-            const existingFile = files.find(file => file.name === 'whatsapp-session.zip');
+            const existing = files.find(file => file.name === 'wa-session.zip');
             
-            if (existingFile) {
-                await existingFile.delete();
-            }
+            if (existing) await existing.delete();
             
-            await megaStorage.root.upload('whatsapp-session.zip', buffer);
-            console.log('Session backed up to Mega');
+            await megaStorage.root.upload('wa-session.zip', buffer);
+            await fs.unlink('./wa-session.zip');
+            console.log('Session backed up');
         });
         
         archive.pipe(output);
         archive.directory('./.wwebjs_auth/', false);
         await archive.finalize();
     } catch (error) {
-        console.error('Session upload error:', error);
+        console.error('Backup error:', error);
     }
+};
+
+const downloadFile = async (fileId, fileInfo) => {
+    const cacheKey = fileId;
+    
+    if (activeDownloads.has(cacheKey)) {
+        return activeDownloads.get(cacheKey);
+    }
+    
+    const downloadPromise = (async () => {
+        try {
+            const file = await bot.telegram.getFile(fileId);
+            const url = `https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`;
+            
+            const response = await AXIOS_INSTANCE.get(url, {
+                responseType: 'arraybuffer',
+                headers: {
+                    'Connection': 'keep-alive'
+                }
+            });
+            
+            const buffer = Buffer.from(response.data);
+            activeDownloads.delete(cacheKey);
+            return buffer;
+        } catch (error) {
+            activeDownloads.delete(cacheKey);
+            throw error;
+        }
+    })();
+    
+    activeDownloads.set(cacheKey, downloadPromise);
+    return downloadPromise;
 };
 
 const initWhatsApp = async () => {
     whatsappClient = new Client({
         authStrategy: new LocalAuth({
-            clientId: "telegram-forwarder"
+            clientId: "fast-forwarder",
+            dataPath: "./.wwebjs_auth"
         }),
         puppeteer: {
             headless: true,
@@ -108,169 +147,208 @@ const initWhatsApp = async () => {
                 '--no-first-run',
                 '--no-zygote',
                 '--single-process',
-                '--disable-gpu'
+                '--disable-gpu',
+                '--disable-software-rasterizer'
             ]
+        },
+        webVersionCache: {
+            type: 'remote',
+            remotePath: 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.2412.54.html',
         }
     });
 
     whatsappClient.on('qr', (qr) => {
-        console.log('QR Code received');
+        console.log('QR received');
         qrcode.generate(qr, { small: true });
-        bot.telegram.sendMessage(ADMIN_ID, `📱 Scan this QR code:\n\n${qr}`);
+        bot.telegram.sendMessage(ADMIN_ID, `📱 Scan QR:\n\n${qr}`);
     });
 
     whatsappClient.on('ready', async () => {
-        console.log('WhatsApp ready!');
+        console.log('WhatsApp ready');
         isReady = true;
         
         const chats = await whatsappClient.getChats();
-        const targetGroup = chats.find(chat => 
+        const group = chats.find(chat => 
             chat.isGroup && chat.name.toLowerCase().includes(WHATSAPP_GROUP_NAME.toLowerCase())
         );
         
-        if (targetGroup) {
-            whatsappGroupId = targetGroup.id._serialized;
-            console.log(`Found group: ${targetGroup.name}`);
-            bot.telegram.sendMessage(ADMIN_ID, `✅ Connected!\nGroup: ${targetGroup.name}`);
+        if (group) {
+            whatsappGroupId = group.id._serialized;
+            console.log(`Group found: ${group.name}`);
+            bot.telegram.sendMessage(ADMIN_ID, `✅ Ready!\nGroup: ${group.name}\n⚡ Ultra-fast mode active`);
         } else {
             bot.telegram.sendMessage(ADMIN_ID, `❌ Group "${WHATSAPP_GROUP_NAME}" not found`);
         }
         
-        await uploadSessionToMega();
-    });
-
-    whatsappClient.on('authenticated', () => {
-        console.log('Authenticated');
+        setTimeout(uploadSessionToMega, 5000);
     });
 
     whatsappClient.on('disconnected', (reason) => {
         console.log('Disconnected:', reason);
         isReady = false;
         bot.telegram.sendMessage(ADMIN_ID, `⚠️ Disconnected: ${reason}`);
-        setTimeout(() => whatsappClient.initialize(), 5000);
+        setTimeout(() => whatsappClient.initialize(), 3000);
     });
 
     whatsappClient.initialize();
 };
 
-const processQueue = async () => {
-    if (isProcessing || messageQueue.length === 0 || !isReady || !whatsappGroupId) return;
+const sendToWhatsApp = async (content, options = {}) => {
+    if (!isReady || !whatsappGroupId) {
+        throw new Error('Not ready');
+    }
     
-    isProcessing = true;
-    const batch = messageQueue.splice(0, 10);
-    
-    await Promise.all(batch.map(async (msg) => {
-        try {
-            await whatsappClient.sendMessage(whatsappGroupId, msg.content, msg.options);
-        } catch (error) {
-            console.error('Send error:', error);
-        }
-    }));
-    
-    isProcessing = false;
-    if (messageQueue.length > 0) setImmediate(processQueue);
+    try {
+        await whatsappClient.sendMessage(whatsappGroupId, content, options);
+    } catch (error) {
+        console.error('Send error:', error);
+        throw error;
+    }
 };
 
 bot.on('channel_post', async (ctx) => {
+    const startTime = Date.now();
+    
     try {
-        let content = ctx.channelPost.text || ctx.channelPost.caption || '';
-        let options = {};
+        const post = ctx.channelPost;
+        const caption = post.text || post.caption || '';
         
-        if (ctx.channelPost.photo) {
-            const photo = ctx.channelPost.photo[ctx.channelPost.photo.length - 1];
-            const file = await bot.telegram.getFile(photo.file_id);
-            const url = `https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`;
-            const response = await axios.get(url, { responseType: 'arraybuffer' });
+        if (post.photo) {
+            const photo = post.photo[post.photo.length - 1];
+            downloadFile(photo.file_id, { type: 'photo' }).then(async buffer => {
+                const media = new MessageMedia('image/jpeg', buffer.toString('base64'));
+                await sendToWhatsApp(media, { caption });
+                console.log(`Photo forwarded in ${Date.now() - startTime}ms`);
+            }).catch(console.error);
             
-            const media = new MessageMedia('image/jpeg', Buffer.from(response.data).toString('base64'));
-            messageQueue.push({ content: media, options: { caption: content } });
-        } else if (ctx.channelPost.video) {
-            const file = await bot.telegram.getFile(ctx.channelPost.video.file_id);
-            const url = `https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`;
-            const response = await axios.get(url, { responseType: 'arraybuffer' });
+        } else if (post.video) {
+            downloadFile(post.video.file_id, { type: 'video' }).then(async buffer => {
+                const media = new MessageMedia('video/mp4', buffer.toString('base64'));
+                await sendToWhatsApp(media, { caption });
+                console.log(`Video forwarded in ${Date.now() - startTime}ms`);
+            }).catch(console.error);
             
-            const media = new MessageMedia('video/mp4', Buffer.from(response.data).toString('base64'));
-            messageQueue.push({ content: media, options: { caption: content } });
-        } else if (ctx.channelPost.document) {
-            const file = await bot.telegram.getFile(ctx.channelPost.document.file_id);
-            const url = `https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`;
-            const response = await axios.get(url, { responseType: 'arraybuffer' });
+        } else if (post.document) {
+            downloadFile(post.document.file_id, { type: 'document' }).then(async buffer => {
+                const media = new MessageMedia(
+                    post.document.mime_type || 'application/octet-stream',
+                    buffer.toString('base64'),
+                    post.document.file_name
+                );
+                await sendToWhatsApp(media, { caption });
+                console.log(`Document forwarded in ${Date.now() - startTime}ms`);
+            }).catch(console.error);
             
-            const media = new MessageMedia(
-                ctx.channelPost.document.mime_type || 'application/octet-stream',
-                Buffer.from(response.data).toString('base64'),
-                ctx.channelPost.document.file_name
-            );
-            messageQueue.push({ content: media, options: { caption: content } });
-        } else if (content) {
-            messageQueue.push({ content, options: {} });
+        } else if (caption) {
+            await sendToWhatsApp(caption);
+            console.log(`Text forwarded in ${Date.now() - startTime}ms`);
         }
         
-        processQueue();
     } catch (error) {
-        console.error('Message handling error:', error);
+        console.error('Forward error:', error);
+        bot.telegram.sendMessage(ADMIN_ID, `❌ Error: ${error.message}`);
     }
+});
+
+bot.on('edited_channel_post', async (ctx) => {
+    console.log('Edited post ignored');
 });
 
 bot.command('status', async (ctx) => {
     if (ctx.from.id.toString() !== ADMIN_ID) return;
     
+    const uptime = process.uptime();
+    const hours = Math.floor(uptime / 3600);
+    const minutes = Math.floor((uptime % 3600) / 60);
+    
     await ctx.reply(`
-🤖 Bot Status:
+⚡ Ultra-Fast Forwarder Status:
 ├ WhatsApp: ${isReady ? '✅ Connected' : '❌ Disconnected'}
-├ Group: ${whatsappGroupId ? '✅ Found' : '❌ Not found'}
-├ Queue: ${messageQueue.length} messages
-└ Processing: ${isProcessing ? 'Yes' : 'No'}
+├ Group: ${whatsappGroupId ? '✅ Ready' : '❌ Not found'}
+├ Active Downloads: ${activeDownloads.size}
+├ Uptime: ${hours}h ${minutes}m
+└ Mode: Lightning Fast ⚡
     `);
 });
 
 bot.command('restart', async (ctx) => {
     if (ctx.from.id.toString() !== ADMIN_ID) return;
     
-    await ctx.reply('♻️ Restarting...');
+    await ctx.reply('⚡ Quick restart...');
     if (whatsappClient) await whatsappClient.destroy();
-    setTimeout(initWhatsApp, 2000);
+    setTimeout(initWhatsApp, 1000);
+});
+
+bot.command('test', async (ctx) => {
+    if (ctx.from.id.toString() !== ADMIN_ID) return;
+    
+    const start = Date.now();
+    try {
+        await sendToWhatsApp('⚡ Speed test message');
+        await ctx.reply(`✅ Test successful! Latency: ${Date.now() - start}ms`);
+    } catch (error) {
+        await ctx.reply(`❌ Test failed: ${error.message}`);
+    }
 });
 
 app.get('/', (req, res) => {
     res.json({
         status: 'running',
-        whatsapp: isReady,
-        queue: messageQueue.length,
-        uptime: process.uptime()
+        ready: isReady,
+        uptime: Math.floor(process.uptime()),
+        mode: 'ultra-fast'
     });
+});
+
+app.get('/health', (req, res) => {
+    res.status(200).send('OK');
 });
 
 const keepAlive = () => {
     setInterval(async () => {
         try {
-            const url = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
-            await axios.get(url);
-            console.log('Keep-alive ping');
-        } catch (error) {
-            console.error('Keep-alive error');
-        }
-    }, 5 * 60 * 1000);
+            const url = process.env.RENDER_EXTERNAL_URL || process.env.RAILWAY_STATIC_URL || `http://localhost:${PORT}`;
+            if (url.includes('localhost')) return;
+            
+            await axios.get(url + '/health', { timeout: 5000 });
+        } catch (error) {}
+    }, 4 * 60 * 1000);
 };
 
-const { MessageMedia } = require('whatsapp-web.js');
-
 const start = async () => {
-    console.log('Starting bot...');
+    console.log('Starting Ultra-Fast Forwarder...');
     
     await initMega();
-    await downloadSessionFromMega();
+    const sessionRestored = await downloadSessionFromMega();
+    
+    if (sessionRestored) {
+        console.log('Using existing session');
+    }
+    
     await initWhatsApp();
     
-    await bot.launch();
-    app.listen(PORT, () => console.log(`Server on port ${PORT}`));
+    bot.telegram.setWebhook('');
+    await bot.launch({
+        allowedUpdates: ['channel_post', 'message']
+    });
+    
+    app.listen(PORT, '0.0.0.0', () => {
+        console.log(`Server running on port ${PORT}`);
+    });
     
     keepAlive();
     
-    bot.telegram.sendMessage(ADMIN_ID, '🚀 Bot started!');
+    bot.telegram.sendMessage(ADMIN_ID, '⚡ Ultra-Fast Forwarder Started!\n\nOptimized for instant deal forwarding.');
 };
 
-process.once('SIGINT', () => bot.stop('SIGINT'));
-process.once('SIGTERM', () => bot.stop('SIGTERM'));
+process.once('SIGINT', () => {
+    bot.stop('SIGINT');
+    if (whatsappClient) whatsappClient.destroy();
+});
 
-start();
+process.once('SIGTERM', () => {
+    bot.stop('SIGTERM');
+    if (whatsappClient) whatsappClient.destroy();
+});
+
+start().catch(console.error);

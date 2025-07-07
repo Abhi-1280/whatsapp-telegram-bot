@@ -1,6 +1,9 @@
-FROM node:18-slim
+FROM ghcr.io/puppeteer/puppeteer:21.5.2
 
-# Install Chrome dependencies
+# Switch to root to install dependencies
+USER root
+
+# Install additional dependencies
 RUN apt-get update && apt-get install -y \
     wget \
     gnupg \
@@ -20,15 +23,31 @@ RUN apt-get update && apt-get install -y \
     libxdamage1 \
     libxrandr2 \
     xdg-utils \
-    --no-install-recommends \
-    && apt-get clean \
-    && rm -rf /var/lib/apt/lists/*
+    --no-install-recommends
 
+# Create app directory
 WORKDIR /app
 
+# Copy package files
 COPY package*.json ./
-RUN npm ci --only=production
 
+# Install dependencies (CHANGED THIS LINE)
+RUN npm install --omit=dev
+
+# Copy application files
 COPY . .
 
+# Create a non-root user to run the app
+RUN groupadd -r pptruser && useradd -r -g pptruser -G audio,video pptruser \
+    && mkdir -p /home/pptruser/Downloads \
+    && chown -R pptruser:pptruser /home/pptruser \
+    && chown -R pptruser:pptruser /app
+
+# Switch to non-root user
+USER pptruser
+
+# Expose port (Render uses 10000 by default)
+EXPOSE 10000
+
+# Start the application
 CMD ["node", "index.js"]

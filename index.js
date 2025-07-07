@@ -15,12 +15,13 @@ const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(`Server running on port ${PORT}`);
 });
 
-// Bot configuration
+// Environment variables
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const ADMIN_ID = process.env.TELEGRAM_ADMIN_ID;
+const SESSION_DATA = process.env.SESSION_DATA;
 const GROUP_NAME = 'savings safari';
 
-// Baileys WhatsApp Client
+// Baileys WhatsApp
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, makeInMemoryStore } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 
@@ -29,66 +30,77 @@ let sock = null;
 let isReady = false;
 let targetGroupId = null;
 const messageQueue = [];
+let isProcessing = false;
 let store;
 
 const bot = new Telegraf(BOT_TOKEN);
 
-// Session management with cloud backup
-const SESSION_BACKUP_URL = process.env.SESSION_BACKUP_URL || 'https://api.jsonbin.io/v3/b/YOUR_BIN_ID';
-const SESSION_API_KEY = process.env.SESSION_API_KEY || 'YOUR_API_KEY';
-
-async function saveSessionToCloud(sessionData) {
+// Session management functions
+async function saveSessionToEnv() {
     try {
-        if (!SESSION_BACKUP_URL || SESSION_BACKUP_URL.includes('YOUR_')) return;
+        const authFolder = './auth_session';
+        const files = await fs.readdir(authFolder);
+        const sessionData = {};
         
-        await axios.put(SESSION_BACKUP_URL, sessionData, {
-            headers: {
-                'Content-Type': 'application/json',
-                'X-Master-Key': SESSION_API_KEY
-            }
-        });
-        console.log('Session backed up to cloud');
+        for (const file of files) {
+            const content = await fs.readFile(path.join(authFolder, file), 'utf-8');
+            sessionData[file] = JSON.parse(content);
+        }
+        
+        const sessionString = Buffer.from(JSON.stringify(sessionData)).toString('base64');
+        
+        console.log('\n=====================================');
+        console.log('IMPORTANT: Add this to Render environment variables:');
+        console.log(`SESSION_DATA=${sessionString}`);
+        console.log('=====================================\n');
+        
+        // Send first 1000 chars to Telegram
+        if (ADMIN_ID) {
+            await bot.telegram.sendMessage(ADMIN_ID, 
+                `💾 *Session saved! Add to environment:*\n\n` +
+                `\`SESSION_DATA=${sessionString.substring(0, 500)}...\`\n\n` +
+                `⚠️ Check server logs for full session string`,
+                { parse_mode: 'Markdown' }
+            );
+        }
     } catch (error) {
-        console.error('Cloud backup error:', error.message);
+        console.error('Session save error:', error);
     }
 }
 
-async function loadSessionFromCloud() {
+async function restoreSessionFromEnv() {
+    if (!SESSION_DATA) return false;
+    
     try {
-        if (!SESSION_BACKUP_URL || SESSION_BACKUP_URL.includes('YOUR_')) return null;
+        const sessionData = JSON.parse(Buffer.from(SESSION_DATA, 'base64').toString());
+        const authFolder = './auth_session';
         
-        const response = await axios.get(SESSION_BACKUP_URL + '/latest', {
-            headers: {
-                'X-Master-Key': SESSION_API_KEY
-            }
-        });
+        await fs.mkdir(authFolder, { recursive: true });
         
-        console.log('Session restored from cloud');
-        return response.data.record;
+        for (const [filename, content] of Object.entries(sessionData)) {
+            await fs.writeFile(path.join(authFolder, filename), JSON.stringify(content));
+        }
+        
+        console.log('✅ Session restored from environment');
+        return true;
     } catch (error) {
-        console.error('Cloud restore error:', error.message);
-        return null;
+        console.error('Session restore error:', error);
+        return false;
     }
 }
 
 async function initializeWhatsApp() {
-    // Try to restore session from cloud first
-    const cloudSession = await loadSessionFromCloud();
+    console.log('Initializing WhatsApp...');
     
-    const authFolder = './auth_session';
-    
-    // If cloud session exists, restore it locally
-    if (cloudSession) {
-        await fs.mkdir(authFolder, { recursive: true });
-        for (const [filename, content] of Object.entries(cloudSession)) {
-            await fs.writeFile(path.join(authFolder, filename), JSON.stringify(content));
-        }
+    // Try to restore session first
+    const sessionRestored = await restoreSessionFromEnv();
+    if (sessionRestored) {
+        console.log('Using restored session - No QR scan needed!');
     }
     
-    const { state, saveCreds } = await useMultiFileAuthState(authFolder);
+    const { state, saveCreds } = await useMultiFileAuthState('./auth_session');
     const { version } = await fetchLatestBaileysVersion();
     
-    // In-memory store for faster performance
     store = makeInMemoryStore({
         logger: pino().child({ level: 'silent', stream: 'store' })
     });
@@ -98,98 +110,83 @@ async function initializeWhatsApp() {
         logger: pino({ level: 'silent' }),
         printQRInTerminal: true,
         auth: state,
-        browser: ['WhatsApp Bot', 'Chrome', '110.0'],
+        browser: ['WhatsApp Forwarder', 'Chrome', '110.0.0'],
         syncFullHistory: false,
         getMessage: async () => null,
         generateHighQualityLinkPreview: false,
+        markOnlineOnConnect: false,
         store
     });
     
     store?.bind(sock.ev);
     
-    // Save credentials and backup to cloud
+    // Save credentials
     sock.ev.on('creds.update', async () => {
         await saveCreds();
-        
-        // Backup to cloud
-        try {
-            const files = await fs.readdir(authFolder);
-            const sessionData = {};
-            
-            for (const file of files) {
-                const content = await fs.readFile(path.join(authFolder, file), 'utf-8');
-                sessionData[file] = JSON.parse(content);
-            }
-            
-            await saveSessionToCloud(sessionData);
-        } catch (error) {
-            console.error('Session backup error:', error);
-        }
+        // Save to environment after authentication
+        setTimeout(saveSessionToEnv, 5000);
     });
     
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
         
         if (qr) {
-            console.log('\n=== FIRST TIME SETUP ===');
-            console.log('Scan this QR code with WhatsApp (Settings > Linked Devices)');
-            console.log('This is ONE TIME ONLY - Session will be saved permanently\n');
+            console.log('\n=== FIRST TIME SETUP - SCAN QR CODE ===');
             
-            // Generate QR code image and send to Telegram
             const QRCode = require('qrcode');
             try {
                 const qrBuffer = await QRCode.toBuffer(qr, {
-                    width: 400,
-                    margin: 2,
-                    color: { dark: '#000000', light: '#FFFFFF' }
+                    width: 512,
+                    margin: 2
                 });
                 
                 await bot.telegram.sendPhoto(ADMIN_ID, { source: qrBuffer }, {
-                    caption: '📱 *ONE TIME SETUP*\n\nScan this QR code in WhatsApp:\n\n' +
-                            '1. Open WhatsApp\n' +
-                            '2. Go to Settings → Linked Devices\n' +
-                            '3. Tap "Link a Device"\n' +
-                            '4. Scan this code\n\n' +
-                            '✅ After this, bot will run forever!',
+                    caption: '📱 *ONE-TIME SETUP*\n\n' +
+                            'Scan this QR code in WhatsApp:\n\n' +
+                            '1. Open WhatsApp on your phone\n' +
+                            '2. Tap Menu or Settings\n' +
+                            '3. Tap "Linked Devices"\n' +
+                            '4. Tap "Link a Device"\n' +
+                            '5. Scan this QR code\n\n' +
+                            '✅ After this, bot runs forever!',
                     parse_mode: 'Markdown'
                 });
             } catch (error) {
-                await bot.telegram.sendMessage(ADMIN_ID, 'Please check console for QR code');
+                await bot.telegram.sendMessage(ADMIN_ID, '📱 QR Code generated - check console');
             }
         }
         
         if (connection === 'close') {
             const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
             
-            if (lastDisconnect?.error?.output?.statusCode === DisconnectReason.loggedOut) {
-                console.log('Logged out from WhatsApp');
-                await bot.telegram.sendMessage(ADMIN_ID, '❌ WhatsApp logged out! Please re-scan QR code.');
-            } else if (shouldReconnect) {
+            if (shouldReconnect) {
                 console.log('Connection lost, reconnecting...');
-                setTimeout(initializeWhatsApp, 5000);
+                setTimeout(initializeWhatsApp, 3000);
+            } else {
+                console.log('Logged out from WhatsApp');
+                if (ADMIN_ID) {
+                    await bot.telegram.sendMessage(ADMIN_ID, '❌ Logged out! Clear SESSION_DATA and restart.');
+                }
             }
         } else if (connection === 'open') {
-            console.log('✅ WhatsApp connected successfully!');
+            console.log('✅ WhatsApp connected!');
             isReady = true;
             
             await setupTargetGroup();
             processQueuedMessages();
             
-            // Keep alive
+            // Keep connection alive
             setInterval(() => {
-                sock.sendPresenceUpdate('available');
+                if (sock && isReady) {
+                    sock.sendPresenceUpdate('available');
+                }
             }, 30000);
         }
     });
     
-    // Handle incoming messages to keep connection alive
-    sock.ev.on('messages.upsert', async ({ messages }) => {
-        // Just acknowledge to keep connection active
-    });
-    
-    // Handle group updates
-    sock.ev.on('group-participants.update', async ({ id, participants, action }) => {
-        // Keep group info updated
+    // Error handling
+    sock.ev.on('error', (error) => {
+        console.error('WhatsApp error:', error);
     });
 }
 
@@ -210,15 +207,15 @@ async function setupTargetGroup() {
                 `🎉 *Bot Ready!*\n\n` +
                 `📱 WhatsApp: Connected\n` +
                 `👥 Group: ${target.subject}\n` +
-                `👤 Participants: ${target.participants.length}\n` +
-                `📨 Queued: ${messageQueue.length} messages\n\n` +
-                `✅ Bot will now run forever without manual intervention!`,
+                `👤 Members: ${target.participants.length}\n` +
+                `📨 Queue: ${messageQueue.length} messages\n` +
+                `⚡ Speed: Ultra-fast forwarding\n\n` +
+                `✅ No manual intervention needed!`,
                 { parse_mode: 'Markdown' }
             );
         } else {
             const availableGroups = groupList
                 .map(g => `• ${g.subject}`)
-                .filter(name => name)
                 .slice(0, 10)
                 .join('\n');
                 
@@ -234,50 +231,119 @@ async function setupTargetGroup() {
 }
 
 async function processQueuedMessages() {
+    if (isProcessing || messageQueue.length === 0) return;
+    
+    isProcessing = true;
+    
     while (messageQueue.length > 0 && isReady && targetGroupId) {
         const msg = messageQueue.shift();
         
         try {
             await sock.sendMessage(targetGroupId, msg.content);
-            console.log(`✅ Sent queued message (${Date.now() - msg.timestamp}ms old)`);
+            console.log(`✅ Sent queued message (${Date.now() - msg.timestamp}ms delay)`);
         } catch (error) {
             console.error('Send error:', error);
             messageQueue.unshift(msg);
             break;
         }
         
-        await new Promise(r => setTimeout(r, 100));
+        // Minimal delay for ultra-fast sending
+        if (messageQueue.length > 0) {
+            await new Promise(r => setTimeout(r, 50));
+        }
+    }
+    
+    isProcessing = false;
+}
+
+// Fast file download
+async function downloadFile(fileId) {
+    try {
+        const file = await bot.telegram.getFile(fileId);
+        const url = `https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`;
+        
+        const response = await axios.get(url, {
+            responseType: 'arraybuffer',
+            timeout: 30000,
+            maxContentLength: 100 * 1024 * 1024,
+            headers: {
+                'Connection': 'keep-alive'
+            }
+        });
+        
+        return Buffer.from(response.data);
+    } catch (error) {
+        console.error('Download error:', error);
+        throw error;
     }
 }
 
-// Telegram message handler
+// Ultra-fast message forwarding
 bot.on('channel_post', async (ctx) => {
+    const startTime = Date.now();
     const post = ctx.channelPost;
     const text = post.text || post.caption || '';
     
-    if (!text) return;
-    
-    const message = {
-        content: { text },
-        timestamp: Date.now()
-    };
-    
+    // Queue if not ready
     if (!isReady || !targetGroupId) {
-        messageQueue.push(message);
+        messageQueue.push({
+            content: { text: text || '[Media message]' },
+            timestamp: startTime
+        });
         console.log('📥 Message queued');
         return;
     }
     
     try {
-        await sock.sendMessage(targetGroupId, { text });
-        console.log(`✅ Forwarded in ${Date.now() - message.timestamp}ms`);
+        if (post.photo) {
+            // Download and send photo
+            const photoId = post.photo[post.photo.length - 1].file_id;
+            downloadFile(photoId).then(async (buffer) => {
+                await sock.sendMessage(targetGroupId, {
+                    image: buffer,
+                    caption: text
+                });
+                console.log(`✅ Photo sent in ${Date.now() - startTime}ms`);
+            }).catch(console.error);
+            
+        } else if (post.video) {
+            // Download and send video
+            downloadFile(post.video.file_id).then(async (buffer) => {
+                await sock.sendMessage(targetGroupId, {
+                    video: buffer,
+                    caption: text
+                });
+                console.log(`✅ Video sent in ${Date.now() - startTime}ms`);
+            }).catch(console.error);
+            
+        } else if (post.document) {
+            // Download and send document
+            downloadFile(post.document.file_id).then(async (buffer) => {
+                await sock.sendMessage(targetGroupId, {
+                    document: buffer,
+                    mimetype: post.document.mime_type,
+                    fileName: post.document.file_name,
+                    caption: text
+                });
+                console.log(`✅ Document sent in ${Date.now() - startTime}ms`);
+            }).catch(console.error);
+            
+        } else if (text) {
+            // Send text message
+            await sock.sendMessage(targetGroupId, { text });
+            console.log(`✅ Text sent in ${Date.now() - startTime}ms`);
+        }
     } catch (error) {
         console.error('Forward error:', error);
-        messageQueue.push(message);
+        messageQueue.push({
+            content: { text: text || '[Failed message]' },
+            timestamp: startTime
+        });
     }
 });
 
-// Admin commands
+// Bot commands
+// Bot commands (continued)
 bot.command('status', async (ctx) => {
     if (ctx.from.id.toString() !== ADMIN_ID) return;
     
@@ -291,8 +357,8 @@ bot.command('status', async (ctx) => {
         `👥 Group: ${targetGroupId ? '✅ Found' : '❌ Not found'}\n` +
         `📨 Queue: ${messageQueue.length} messages\n` +
         `⏱️ Uptime: ${hours}h ${minutes}m\n` +
-        `💾 Session: ${await fs.access('./auth_session').then(() => '✅ Saved').catch(() => '❌ Not found')}\n` +
-        `☁️ Cloud Backup: ${SESSION_BACKUP_URL.includes('YOUR_') ? '❌ Not configured' : '✅ Active'}`,
+        `💾 Session: ${SESSION_DATA ? '✅ Loaded' : '❌ Not set'}\n` +
+        `🚀 Mode: Ultra-fast forwarding`,
         { parse_mode: 'Markdown' }
     );
 });
@@ -308,23 +374,17 @@ bot.command('restart', async (ctx) => {
     setTimeout(initializeWhatsApp, 3000);
 });
 
-bot.command('backup', async (ctx) => {
+bot.command('queue', async (ctx) => {
     if (ctx.from.id.toString() !== ADMIN_ID) return;
     
-    try {
-        const authFolder = './auth_session';
-        const files = await fs.readdir(authFolder);
-        const sessionData = {};
-        
-        for (const file of files) {
-            const content = await fs.readFile(path.join(authFolder, file), 'utf-8');
-            sessionData[file] = JSON.parse(content);
-        }
-        
-        await saveSessionToCloud(sessionData);
-        await ctx.reply('✅ Session backed up to cloud successfully!');
-    } catch (error) {
-        await ctx.reply(`❌ Backup failed: ${error.message}`);
+    if (messageQueue.length === 0) {
+        await ctx.reply('📨 No messages in queue');
+    } else {
+        await ctx.reply(`📨 Queue: ${messageQueue.length} messages\n\n` +
+            messageQueue.slice(0, 5).map((m, i) => 
+                `${i + 1}. ${m.content.text?.substring(0, 50)}...`
+            ).join('\n')
+        );
     }
 });
 
@@ -349,11 +409,57 @@ bot.command('groups', async (ctx) => {
     }
 });
 
-// Auto-restart on errors
+bot.command('session', async (ctx) => {
+    if (ctx.from.id.toString() !== ADMIN_ID) return;
+    
+    if (SESSION_DATA) {
+        await ctx.reply('✅ Session is set in environment variables');
+    } else {
+        await saveSessionToEnv();
+        await ctx.reply('📤 Session saved! Check logs for SESSION_DATA');
+    }
+});
+
+// Auto-ping to keep Render alive
+const keepAlive = () => {
+    // Ping every 5 minutes
+    setInterval(async () => {
+        if (process.env.RENDER_EXTERNAL_URL) {
+            try {
+                await axios.get(process.env.RENDER_EXTERNAL_URL + '/health', { timeout: 10000 });
+                console.log('Keep-alive ping sent');
+            } catch (error) {
+                console.error('Keep-alive error:', error.message);
+            }
+        }
+        
+        // Keep WhatsApp connection alive
+        if (sock && isReady) {
+            try {
+                await sock.sendPresenceUpdate('available');
+            } catch (error) {}
+        }
+    }, 5 * 60 * 1000); // 5 minutes
+    
+    // More aggressive ping for first 30 minutes
+        // More aggressive ping for first 30 minutes
+    const aggressivePing = setInterval(async () => {
+        if (process.env.RENDER_EXTERNAL_URL) {
+            try {
+                await axios.get(process.env.RENDER_EXTERNAL_URL + '/health', { timeout: 5000 });
+            } catch (error) {}
+        }
+    }, 60 * 1000); // Every minute
+    
+    // Stop aggressive ping after 30 minutes
+    setTimeout(() => clearInterval(aggressivePing), 30 * 60 * 1000);
+};
+
+// Error handling
 process.on('uncaughtException', (error) => {
     console.error('Uncaught Exception:', error);
-    if (ADMIN_ID) {
-        bot.telegram.sendMessage(ADMIN_ID, `⚠️ Error: ${error.message}\nRestarting...`);
+    if (ADMIN_ID && bot) {
+        bot.telegram.sendMessage(ADMIN_ID, `⚠️ Error: ${error.message}\nRestarting...`).catch(() => {});
     }
     setTimeout(() => process.exit(1), 1000);
 });
@@ -362,68 +468,69 @@ process.on('unhandledRejection', (error) => {
     console.error('Unhandled Rejection:', error);
 });
 
-// Keep alive mechanism
-const keepAlive = () => {
-    setInterval(async () => {
-        if (process.env.RENDER_EXTERNAL_URL) {
-            try {
-                await axios.get(process.env.RENDER_EXTERNAL_URL + '/health');
-            } catch (error) {}
-        }
-        
-        // Keep WhatsApp alive
-        if (isReady && sock) {
-            try {
-                await sock.sendPresenceUpdate('available');
-            } catch (error) {}
-        }
-    }, 4 * 60 * 1000);
-};
-
-// Initialize everything
+// Main startup function
 async function startBot() {
-    console.log('🚀 Starting WhatsApp-Telegram Bot...');
+    console.log('🚀 Starting WhatsApp-Telegram Forwarder...');
+    console.log(`📍 Port: ${PORT}`);
+    console.log(`💾 Session: ${SESSION_DATA ? 'Found' : 'Not set'}`);
     
-    // Launch Telegram bot
-    await bot.launch();
-    console.log('✅ Telegram bot started');
-    
-    // Initialize WhatsApp
-    setTimeout(initializeWhatsApp, 2000);
-    
-    // Start keep-alive
-    keepAlive();
-    
-    // Notify admin
-    if (ADMIN_ID) {
-        await bot.telegram.sendMessage(ADMIN_ID, 
-            '🚀 *Bot Started Successfully!*\n\n' +
-            '⏳ Initializing WhatsApp...\n' +
-            '💾 Session will be restored if available\n' +
-            '📱 Otherwise, one-time QR scan required',
-            { parse_mode: 'Markdown' }
-        );
+    try {
+        // Launch Telegram bot
+        await bot.launch({
+            webhook: {
+                domain: process.env.RENDER_EXTERNAL_URL,
+                port: PORT
+            }
+        }).catch(async () => {
+            // Fallback to polling if webhook fails
+            console.log('Webhook failed, using polling mode');
+            await bot.launch();
+        });
+        
+        console.log('✅ Telegram bot started');
+        
+        // Initialize WhatsApp after 2 seconds
+        setTimeout(initializeWhatsApp, 2000);
+        
+        // Start keep-alive mechanism
+        keepAlive();
+        
+        // Notify admin
+        if (ADMIN_ID) {
+            await bot.telegram.sendMessage(ADMIN_ID, 
+                '🚀 *Bot Deployed Successfully!*\n\n' +
+                '⏳ Initializing WhatsApp...\n' +
+                `💾 Session: ${SESSION_DATA ? 'Will restore automatically' : 'First time - QR scan needed'}\n` +
+                '⚡ Ultra-fast forwarding enabled\n' +
+                '🔄 Auto-ping active',
+                { parse_mode: 'Markdown' }
+            );
+        }
+    } catch (error) {
+        console.error('Startup error:', error);
+        process.exit(1);
     }
 }
 
 // Graceful shutdown
 process.once('SIGINT', () => {
-    console.log('Shutting down...');
+    console.log('SIGINT received, shutting down gracefully...');
     bot.stop('SIGINT');
-    if (sock) sock.ws.close();
+    if (sock) sock.end();
     server.close();
     process.exit(0);
 });
 
 process.once('SIGTERM', () => {
-    console.log('Shutting down...');
+    console.log('SIGTERM received, shutting down gracefully...');
     bot.stop('SIGTERM');
-    if (sock) sock.ws.close();
+    if (sock) sock.end();
     server.close();
     process.exit(0);
 });
 
 // Start the bot
-startBot().catch(console.error);
-    
-    
+startBot().catch(error => {
+    console.error('Failed to start bot:', error);
+    process.exit(1);
+});

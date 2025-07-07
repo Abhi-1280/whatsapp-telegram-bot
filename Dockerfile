@@ -1,42 +1,49 @@
-# Use official Node.js base image
-FROM node:18-slim
+FROM ghcr.io/puppeteer/puppeteer:21.5.2
 
-# Install necessary system dependencies for Puppeteer (headless Chromium)
+USER root
+
+# Install additional dependencies
 RUN apt-get update && apt-get install -y \
-  wget \
-  ca-certificates \
-  fonts-liberation \
-  libappindicator3-1 \
-  libasound2 \
-  libatk-bridge2.0-0 \
-  libatk1.0-0 \
-  libcups2 \
-  libdbus-1-3 \
-  libdrm2 \
-  libgbm1 \
-  libgtk-3-0 \
-  libnspr4 \
-  libnss3 \
-  libx11-xcb1 \
-  libxcomposite1 \
-  libxdamage1 \
-  libxrandr2 \
-  xdg-utils \
-  --no-install-recommends && \
-  rm -rf /var/lib/apt/lists/*
+    wget \
+    gnupg \
+    ca-certificates \
+    fonts-liberation \
+    libappindicator3-1 \
+    libasound2 \
+    libatk-bridge2.0-0 \
+    libatk1.0-0 \
+    libcups2 \
+    libdbus-1-3 \
+    libgdk-pixbuf2.0-0 \
+    libnspr4 \
+    libnss3 \
+    libx11-xcb1 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxrandr2 \
+    xdg-utils \
+    --no-install-recommends \
+    && rm -rf /var/lib/apt/lists/*
 
-# Create app directory
 WORKDIR /app
 
-# Copy package files and install
+# Copy package files
 COPY package*.json ./
+
+# Install dependencies - use npm install if no lock file
 RUN npm install
 
-# Copy the rest of the app
+# Copy application files
 COPY . .
 
-# Expose port (if needed)
-EXPOSE 3000
+# Create a non-root user
+RUN groupadd -r pptruser && useradd -r -g pptruser -G audio,video pptruser \
+    && mkdir -p /home/pptruser/Downloads \
+    && chown -R pptruser:pptruser /home/pptruser \
+    && chown -R pptruser:pptruser /app
 
-# Run the bot
+USER pptruser
+
+EXPOSE 10000
+
 CMD ["node", "index.js"]

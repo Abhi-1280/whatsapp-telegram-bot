@@ -19,7 +19,7 @@ const server = app.listen(PORT, '0.0.0.0', () => {
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const ADMIN_ID = process.env.TELEGRAM_ADMIN_ID;
 const SESSION_DATA = process.env.SESSION_DATA;
-const GROUP_NAME = 'savings safari';
+const COMMUNITY_NAME = 'savings safari';
 
 // Validate environment variables
 if (!BOT_TOKEN) {
@@ -46,7 +46,8 @@ const QRCode = require('qrcode');
 // Global variables
 let sock = null;
 let isReady = false;
-let targetGroupId = null;
+let targetCommunityId = null;
+let targetAnnouncementId = null;
 const messageQueue = [];
 let isProcessing = false;
 let qrRetries = 0;
@@ -255,8 +256,8 @@ async function initializeWhatsApp() {
                 qrRetries = 0;
                 initAttempts = 0;
                 
-                // Setup group and process queue
-                await setupTargetGroup();
+                // Setup community and process queue
+                await setupTargetCommunity();
                 
                 if (messageQueue.length > 0) {
                     console.log(`📨 Processing ${messageQueue.length} queued messages...`);
@@ -300,64 +301,130 @@ async function initializeWhatsApp() {
     }
 }
 
-async function setupTargetGroup() {
+async function setupTargetCommunity() {
     try {
-        console.log('🔍 Looking for WhatsApp groups...');
+        console.log('🔍 Looking for WhatsApp communities and groups...');
         
+                // First, get all groups (communities are also listed here)
         const groups = await sock.groupFetchAllParticipating();
         const groupList = Object.values(groups);
         
-        console.log(`Found ${groupList.length} groups`);
+        console.log(`Found ${groupList.length} groups/communities`);
         
-        const target = groupList.find(g => 
-            g.subject && g.subject.toLowerCase().includes(GROUP_NAME.toLowerCase())
-        );
+        // Look for the community
+        let targetCommunity = null;
+        let announcementGroup = null;
         
-        if (target) {
-            targetGroupId = target.id;
-            console.log(`✅ Target group found: ${target.subject}`);
+        for (const group of groupList) {
+            // Check if it's a community by checking if it has linked groups
+            if (group.isCommunity || group.linkedParent) {
+                console.log(`🏘️ Found community: ${group.subject}`);
+                
+                if (group.subject && group.subject.toLowerCase().includes(COMMUNITY_NAME.toLowerCase())) {
+                    targetCommunity = group;
+                    targetCommunityId = group.id;
+                    console.log(`✅ Target community found: ${group.subject}`);
+                    break;
+                }
+            }
+        }
+        
+        // If we found the community, look for its announcement group
+        if (targetCommunity) {
+            // For communities, the announcement group is usually the community itself
+            // or it might have a specific announcement subgroup
+            targetAnnouncementId = targetCommunityId;
+            
+            // Check if there are linked groups (subgroups of the community)
+            const linkedGroups = groupList.filter(g => 
+                g.linkedParent === targetCommunityId || 
+                g.parentGroupId === targetCommunityId
+            );
+            
+            if (linkedGroups.length > 0) {
+                console.log(`Found ${linkedGroups.length} linked groups in the community`);
+                
+                // Look for announcement group
+                const announcement = linkedGroups.find(g => 
+                    g.announce === true || 
+                    g.restrict === true ||
+                    g.subject?.toLowerCase().includes('announcement') ||
+                    g.subject?.toLowerCase().includes('announce')
+                );
+                
+                if (announcement) {
+                    targetAnnouncementId = announcement.id;
+                    console.log(`📢 Using announcement group: ${announcement.subject}`);
+                }
+            }
             
             await bot.telegram.sendMessage(ADMIN_ID,
                 `🎉 *Bot Ready!*\n\n` +
                 `📱 WhatsApp: Connected\n` +
-                `👥 Group: ${target.subject}\n` +
-                `👤 Members: ${target.participants.length}\n` +
+                `🏘️ Community: ${targetCommunity.subject}\n` +
+                `📢 Target: ${targetAnnouncementId === targetCommunityId ? 'Main Community' : 'Announcement Group'}\n` +
                 `📨 Queue: ${messageQueue.length} messages\n\n` +
                 `✅ Forwarding active!`,
                 { parse_mode: 'Markdown' }
             ).catch(console.error);
             
-                        // Start processing queue if any
+            // Start processing queue if any
             if (messageQueue.length > 0) {
                 processQueuedMessages();
             }
         } else {
-            console.log(`❌ Group "${GROUP_NAME}" not found`);
+            // If not found as community, check regular groups
+            const target = groupList.find(g => 
+                g.subject && g.subject.toLowerCase().includes(COMMUNITY_NAME.toLowerCase())
+            );
             
-            const groupNames = groupList.map(g => g.subject).slice(0, 10).join('\n• ');
-            
-            await bot.telegram.sendMessage(ADMIN_ID,
-                `⚠️ *Group Not Found*\n\n` +
-                `Looking for: "${GROUP_NAME}"\n\n` +
-                `Available groups:\n• ${groupNames}`,
-                { parse_mode: 'Markdown' }
-            ).catch(console.error);
+            if (target) {
+                targetAnnouncementId = target.id;
+                console.log(`✅ Found as regular group: ${target.subject}`);
+                
+                await bot.telegram.sendMessage(ADMIN_ID,
+                    `🎉 *Bot Ready!*\n\n` +
+                    `📱 WhatsApp: Connected\n` +
+                    `👥 Group: ${target.subject}\n` +
+                    `👤 Members: ${target.participants?.length || 'Unknown'}\n` +
+                    `📨 Queue: ${messageQueue.length} messages\n\n` +
+                    `✅ Forwarding active!`,
+                    { parse_mode: 'Markdown' }
+                ).catch(console.error);
+                
+                if (messageQueue.length > 0) {
+                    processQueuedMessages();
+                }
+            } else {
+                console.log(`❌ Community/Group "${COMMUNITY_NAME}" not found`);
+                
+                const names = groupList.map(g => 
+                    `${g.isCommunity ? '🏘️' : '👥'} ${g.subject}`
+                ).slice(0, 15).join('\n');
+                
+                await bot.telegram.sendMessage(ADMIN_ID,
+                    `⚠️ *Community/Group Not Found*\n\n` +
+                    `Looking for: "${COMMUNITY_NAME}"\n\n` +
+                    `Available:\n${names}`,
+                    { parse_mode: 'Markdown' }
+                ).catch(console.error);
+            }
         }
     } catch (error) {
-        console.error('Group setup error:', error);
-        setTimeout(setupTargetGroup, 5000);
+        console.error('Community setup error:', error);
+        setTimeout(setupTargetCommunity, 5000);
     }
 }
 
 async function processQueuedMessages() {
-    if (isProcessing || messageQueue.length === 0 || !isReady || !targetGroupId) {
+    if (isProcessing || messageQueue.length === 0 || !isReady || !targetAnnouncementId) {
         return;
     }
     
     isProcessing = true;
     console.log(`📤 Processing ${messageQueue.length} queued messages...`);
     
-    while (messageQueue.length > 0 && isReady && targetGroupId) {
+    while (messageQueue.length > 0 && isReady && targetAnnouncementId) {
         const msg = messageQueue.shift();
         
         try {
@@ -365,26 +432,26 @@ async function processQueuedMessages() {
             if (msg.type === 'photo' && msg.post?.photo) {
                 const photoId = msg.post.photo[msg.post.photo.length - 1].file_id;
                 const buffer = await downloadFile(photoId);
-                await sock.sendMessage(targetGroupId, {
+                await sock.sendMessage(targetAnnouncementId, {
                     image: buffer,
                     caption: msg.post.caption || ''
                 });
             } else if (msg.type === 'video' && msg.post?.video) {
                 const buffer = await downloadFile(msg.post.video.file_id);
-                await sock.sendMessage(targetGroupId, {
+                await sock.sendMessage(targetAnnouncementId, {
                     video: buffer,
                     caption: msg.post.caption || ''
                 });
             } else if (msg.type === 'document' && msg.post?.document) {
                 const buffer = await downloadFile(msg.post.document.file_id);
-                await sock.sendMessage(targetGroupId, {
+                await sock.sendMessage(targetAnnouncementId, {
                     document: buffer,
                     mimetype: msg.post.document.mime_type,
                     fileName: msg.post.document.file_name,
                     caption: msg.post.caption || ''
                 });
             } else {
-                await sock.sendMessage(targetGroupId, msg.content);
+                await sock.sendMessage(targetAnnouncementId, msg.content);
             }
             
             console.log(`✅ Sent queued message (${messageQueue.length} remaining)`);
@@ -431,7 +498,7 @@ bot.on('channel_post', async (ctx) => {
     console.log(`📨 New message: ${text?.substring(0, 50) || '[Media]'}`);
     
     // Queue if not ready
-    if (!isReady || !targetGroupId) {
+    if (!isReady || !targetAnnouncementId) {
         messageQueue.push({
             content: { text: text || '[Media message]' },
             timestamp: startTime,
@@ -455,7 +522,7 @@ bot.on('channel_post', async (ctx) => {
             // Download and send immediately
             const photoId = post.photo[post.photo.length - 1].file_id;
             downloadFile(photoId).then(async (buffer) => {
-                await sock.sendMessage(targetGroupId, {
+                await sock.sendMessage(targetAnnouncementId, {
                     image: buffer,
                     caption: text
                 });
@@ -472,7 +539,7 @@ bot.on('channel_post', async (ctx) => {
             
         } else if (post.video) {
             downloadFile(post.video.file_id).then(async (buffer) => {
-                await sock.sendMessage(targetGroupId, {
+                await sock.sendMessage(targetAnnouncementId, {
                     video: buffer,
                     caption: text
                 });
@@ -489,7 +556,7 @@ bot.on('channel_post', async (ctx) => {
             
         } else if (post.document) {
             downloadFile(post.document.file_id).then(async (buffer) => {
-                await sock.sendMessage(targetGroupId, {
+                await sock.sendMessage(targetAnnouncementId, {
                     document: buffer,
                     mimetype: post.document.mime_type,
                     fileName: post.document.file_name,
@@ -507,7 +574,7 @@ bot.on('channel_post', async (ctx) => {
             });
             
         } else if (text) {
-            await sock.sendMessage(targetGroupId, { text });
+            await sock.sendMessage(targetAnnouncementId, { text });
             console.log(`✅ Text sent in ${Date.now() - startTime}ms`);
         }
     } catch (error) {
@@ -533,7 +600,7 @@ bot.command('start', async (ctx) => {
         `/status - Check status\n` +
         `/restart - Restart WhatsApp\n` +
         `/queue - View queue\n` +
-        `/groups - List groups\n` +
+        `/groups - List groups/communities\n` +
         `/session - Save session\n` +
         `/test - Test message\n` +
         `/clear - Clear queue`,
@@ -551,7 +618,8 @@ bot.command('status', async (ctx) => {
     await ctx.reply(
         `📊 *Status*\n\n` +
         `WhatsApp: ${isReady ? '✅ Connected' : '❌ Disconnected'}\n` +
-        `Group: ${targetGroupId ? '✅ Found' : '❌ Not found'}\n` +
+        `Community: ${targetCommunityId ? '✅ Found' : '❌ Not found'}\n` +
+        `Target: ${targetAnnouncementId ? '✅ Set' : '❌ Not set'}\n` +
         `Queue: ${messageQueue.length} messages\n` +
         `Uptime: ${hours}h ${minutes}m\n` +
         `Session: ${SESSION_DATA ? '✅ Loaded' : '❌ Not set'}`,
@@ -602,11 +670,15 @@ bot.command('groups', async (ctx) => {
     try {
         const groups = await sock.groupFetchAllParticipating();
         const list = Object.values(groups)
-            .map((g, i) => `${i+1}. ${g.subject}`)
+                        .map((g, i) => {
+                const type = g.isCommunity ? '🏘️' : '👥';
+                const isTarget = g.id === targetAnnouncementId ? ' ✅' : '';
+                return `${i+1}. ${type} ${g.subject}${isTarget}`;
+            })
             .slice(0, 20)
             .join('\n');
             
-        await ctx.reply(`📱 *Groups:*\n\n${list}`, { parse_mode: 'Markdown' });
+        await ctx.reply(`📱 *Groups/Communities:*\n\n${list}`, { parse_mode: 'Markdown' });
     } catch (error) {
         await ctx.reply(`❌ Error: ${error.message}`);
     }
@@ -626,13 +698,13 @@ bot.command('session', async (ctx) => {
 bot.command('test', async (ctx) => {
     if (ctx.from.id.toString() !== ADMIN_ID) return;
     
-    if (!isReady || !targetGroupId) {
+    if (!isReady || !targetAnnouncementId) {
         await ctx.reply('❌ Not ready');
         return;
     }
     
     try {
-        await sock.sendMessage(targetGroupId, { 
+        await sock.sendMessage(targetAnnouncementId, { 
             text: `🧪 Test message\nTime: ${new Date().toLocaleString()}`
         });
         await ctx.reply('✅ Test sent');
@@ -647,6 +719,73 @@ bot.command('clear', async (ctx) => {
     const count = messageQueue.length;
     messageQueue.length = 0;
     await ctx.reply(`🗑️ Cleared ${count} messages`);
+});
+
+// New command to manually set community
+bot.command('setcommunity', async (ctx) => {
+    if (ctx.from.id.toString() !== ADMIN_ID) return;
+    
+    const args = ctx.message.text.split(' ').slice(1);
+    if (args.length === 0) {
+        await ctx.reply('Usage: /setcommunity <number from /groups list>');
+        return;
+    }
+    
+    if (!isReady || !sock) {
+        await ctx.reply('❌ WhatsApp not connected');
+        return;
+    }
+    
+    try {
+        const groups = await sock.groupFetchAllParticipating();
+        const groupList = Object.values(groups);
+        const index = parseInt(args[0]) - 1;
+        
+        if (index >= 0 && index < groupList.length) {
+            const selected = groupList[index];
+            targetAnnouncementId = selected.id;
+            targetCommunityId = selected.id;
+            
+            await ctx.reply(
+                `✅ *Target Set*\n\n` +
+                `Type: ${selected.isCommunity ? '🏘️ Community' : '👥 Group'}\n` +
+                `Name: ${selected.subject}\n` +
+                `ID: ${selected.id}`,
+                { parse_mode: 'Markdown' }
+            );
+        } else {
+            await ctx.reply('❌ Invalid group number');
+        }
+    } catch (error) {
+        await ctx.reply(`❌ Error: ${error.message}`);
+    }
+});
+
+// Command to check community info
+bot.command('info', async (ctx) => {
+    if (ctx.from.id.toString() !== ADMIN_ID) return;
+    
+    if (!isReady || !sock || !targetAnnouncementId) {
+        await ctx.reply('❌ Not ready or no target set');
+        return;
+    }
+    
+    try {
+        const metadata = await sock.groupMetadata(targetAnnouncementId);
+        const info = 
+            `📊 *Target Info*\n\n` +
+            `Name: ${metadata.subject}\n` +
+            `ID: ${metadata.id}\n` +
+            `Owner: ${metadata.owner || 'Unknown'}\n` +
+            `Created: ${new Date(metadata.creation * 1000).toLocaleDateString()}\n` +
+            `Participants: ${metadata.participants.length}\n` +
+            `Announce: ${metadata.announce ? 'Yes' : 'No'}\n` +
+            `Restricted: ${metadata.restrict ? 'Yes' : 'No'}`;
+            
+        await ctx.reply(info, { parse_mode: 'Markdown' });
+    } catch (error) {
+        await ctx.reply(`❌ Error: ${error.message}`);
+    }
 });
 
 // Keep alive mechanism
@@ -680,6 +819,7 @@ process.on('unhandledRejection', (error) => {
 // Main startup
 async function startBot() {
     console.log('🚀 Starting WhatsApp-Telegram Forwarder...');
+    console.log(`🏘️ Looking for community: "${COMMUNITY_NAME}"`);
     
     try {
         // Start Telegram bot
@@ -694,6 +834,7 @@ async function startBot() {
         await bot.telegram.sendMessage(ADMIN_ID, 
             `🚀 *Bot Started!*\n\n` +
             `Bot: @${me.username}\n` +
+            `Target: ${COMMUNITY_NAME}\n` +
             `Session: ${SESSION_DATA ? 'Found ✅' : 'Not found ❌'}\n\n` +
             `Initializing WhatsApp...`,
             { parse_mode: 'Markdown' }

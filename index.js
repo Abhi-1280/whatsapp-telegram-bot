@@ -33,8 +33,9 @@ if (!ADMIN_ID) {
 }
 
 // Baileys WhatsApp
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, makeInMemoryStore } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, makeInMemoryStore, delay } = require('@whiskeysockets/baileys');
 const pino = require('pino');
+const QRCode = require('qrcode');
 
 // Global variables
 let sock = null;
@@ -43,6 +44,8 @@ let targetGroupId = null;
 const messageQueue = [];
 let isProcessing = false;
 let store;
+let qrRetries = 0;
+let initAttempts = 0;
 
 // Initialize Telegram bot
 const bot = new Telegraf(BOT_TOKEN);
@@ -66,12 +69,35 @@ async function saveSessionToEnv() {
         console.log(`SESSION_DATA=${sessionString}`);
         console.log('=====================================\n');
         
-        // Send to Telegram admin
+        // Save to file for backup
+        await fs.writeFile('session_backup.txt', `SESSION_DATA=${sessionString}`);
+        
+        // Send to Telegram admin in chunks
         try {
+            const chunkSize = 4000;
+            const chunks = [];
+            
+            for (let i = 0; i < sessionString.length; i += chunkSize) {
+                chunks.push(sessionString.substring(i, i + chunkSize));
+            }
+            
             await bot.telegram.sendMessage(ADMIN_ID, 
-                `💾 *Session saved! Add to environment:*\n\n` +
-                `Check server logs for full SESSION_DATA string\n\n` +
-                `⚠️ Copy the entire string and add it to Render environment variables`,
+                `💾 *Session Saved Successfully!*\n\n` +
+                `Total parts: ${chunks.length}\n\n` +
+                `⚠️ *IMPORTANT: Copy all parts and combine them into one SESSION_DATA string*`,
+                { parse_mode: 'Markdown' }
+            );
+            
+            for (let i = 0; i < chunks.length; i++) {
+                await bot.telegram.sendMessage(ADMIN_ID, 
+                    `📄 *Part ${i + 1}/${chunks.length}:*\n\n\`\`\`\n${chunks[i]}\n\`\`\``,
+                    { parse_mode: 'Markdown' }
+                );
+                await delay(1000); // Small delay between messages
+            }
+            
+            await bot.telegram.sendMessage(ADMIN_ID, 
+                `✅ *All parts sent!*\n\nCombine all parts into one string and add to Render environment variables.`,
                 { parse_mode: 'Markdown' }
             );
         } catch (error) {
@@ -84,11 +110,12 @@ async function saveSessionToEnv() {
 
 async function restoreSessionFromEnv() {
     if (!SESSION_DATA) {
-        console.log('No SESSION_DATA found in environment');
+        console.log('❌ No SESSION_DATA found in environment');
         return false;
     }
     
     try {
+        console.log('📂 Restoring session from environment...');
         const sessionData = JSON.parse(Buffer.from(SESSION_DATA, 'base64').toString());
         const authFolder = './auth_session';
         
@@ -98,24 +125,35 @@ async function restoreSessionFromEnv() {
             await fs.writeFile(path.join(authFolder, filename), JSON.stringify(content));
         }
         
-        console.log('✅ Session restored from environment');
+        console.log('✅ Session restored successfully!');
         return true;
     } catch (error) {
-        console.error('Session restore error:', error);
+        console.error('❌ Session restore error:', error);
         return false;
     }
 }
 
 async function initializeWhatsApp() {
     try {
-        console.log('🔄 Initializing WhatsApp...');
+        initAttempts++;
+        console.log(`\n🔄 WhatsApp initialization attempt #${initAttempts}`);
         
-        // Try to restore session first
+        // Clean up previous connection
+        if (sock) {
+            sock.end();
+            sock = null;
+        }
+        
+        isReady = false;
+        
+        // Restore session if available
         const sessionRestored = await restoreSessionFromEnv();
         if (sessionRestored) {
-            console.log('✅ Using restored session - No QR scan needed!');
+            console.log('✅ Session restored - Auto-connecting...');
+            await bot.telegram.sendMessage(ADMIN_ID, '📱 Session found! Connecting to WhatsApp...').catch(console.error);
         } else {
-            console.log('⚠️ No session found - QR scan will be required');
+            console.log('⚠️ No session - QR scan required');
+            await bot.telegram.sendMessage(ADMIN_ID, '📱 First time setup - QR code coming...').catch(console.error);
         }
         
         const { state, saveCreds } = await useMultiFileAuthState('./auth_session');
@@ -130,84 +168,103 @@ async function initializeWhatsApp() {
             logger: pino({ level: 'silent' }),
             printQRInTerminal: true,
             auth: state,
-            browser: ['WhatsApp Forwarder', 'Chrome', '110.0.0'],
-            syncFullHistory: false,
-            getMessage: async () => null,
+            browser: ['WhatsApp Forwarder', 'Chrome', '120.0.0'],
             generateHighQualityLinkPreview: false,
+            syncFullHistory: false,
             markOnlineOnConnect: false,
+            defaultQueryTimeoutMs: 60000,
+            keepAliveIntervalMs: 30000,
+            connectTimeoutMs: 60000,
+            qrTimeout: 60000,
+            getMessage: async () => null,
             store
         });
         
-        store?.bind(sock.ev);
+        if (store) {
+            store.bind(sock.ev);
+        }
         
-        // Save credentials
+        // Handle credentials update
         sock.ev.on('creds.update', async () => {
+            console.log('📱 Saving credentials...');
             await saveCreds();
-            console.log('📱 Credentials updated');
-            // Save to environment after authentication
-            setTimeout(saveSessionToEnv, 5000);
+            // Delay before saving to ensure all files are written
+            setTimeout(() => {
+                console.log('💾 Backing up session...');
+                saveSessionToEnv();
+            }, 3000);
         });
         
+        // Connection update handler
         sock.ev.on('connection.update', async (update) => {
             const { connection, lastDisconnect, qr } = update;
             
             if (qr) {
-                console.log('\n=== FIRST TIME SETUP - SCAN QR CODE ===');
-                console.log('QR Code generated - sending to Telegram...');
+                qrRetries++;
+                console.log(`\n📱 QR CODE GENERATED (Attempt ${qrRetries})`);
                 
                 try {
-                    const QRCode = require('qrcode');
                     const qrBuffer = await QRCode.toBuffer(qr, {
                         width: 512,
-                        margin: 2
+                        margin: 2,
+                        scale: 8,
+                        errorCorrectionLevel: 'M',
+                        color: {
+                            dark: '#000000',
+                            light: '#FFFFFF'
+                        }
                     });
                     
                     await bot.telegram.sendPhoto(ADMIN_ID, { source: qrBuffer }, {
-                        caption: '📱 *ONE-TIME SETUP*\n\n' +
-                                'Scan this QR code in WhatsApp:\n\n' +
-                                '1. Open WhatsApp on your phone\n' +
-                                '2. Tap Menu or Settings\n' +
-                                '3. Tap "Linked Devices"\n' +
-                                '4. Tap "Link a Device"\n' +
-                                '5. Scan this QR code\n\n' +
-                                '✅ After this, bot runs forever!',
+                        caption: `📱 *WhatsApp QR Code*\n\n` +
+                                `⚠️ *SCAN NOW - Expires in 60 seconds!*\n\n` +
+                                `Steps:\n` +
+                                `1️⃣ Open WhatsApp\n` +
+                                `2️⃣ Tap Menu ⋮ → Linked Devices\n` +
+                                `3️⃣ Tap "Link a Device"\n` +
+                                `4️⃣ Scan this QR code\n\n` +
+                                `Attempt: ${qrRetries}/3`,
                         parse_mode: 'Markdown'
                     });
+                    
                     console.log('✅ QR Code sent to Telegram');
                 } catch (error) {
-                    console.error('Failed to send QR code:', error);
-                    await bot.telegram.sendMessage(ADMIN_ID, '📱 QR Code generated - check console logs');
+                    console.error('❌ Failed to send QR:', error);
                 }
             }
             
             if (connection === 'close') {
                 const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-                console.log('Connection closed:', lastDisconnect?.error);
+                const reason = lastDisconnect?.error?.output?.statusCode;
+                
+                console.log(`❌ Connection closed: ${reason}`);
                 
                 if (shouldReconnect) {
-                    console.log('📱 Connection lost, reconnecting in 3 seconds...');
+                    console.log('🔄 Reconnecting in 3 seconds...');
                     setTimeout(initializeWhatsApp, 3000);
                 } else {
-                    console.log('❌ Logged out from WhatsApp');
-                    try {
-                        await bot.telegram.sendMessage(ADMIN_ID, '❌ WhatsApp logged out! Clear SESSION_DATA and restart.');
-                    } catch (error) {
-                        console.error('Failed to send logout notification:', error);
-                    }
+                    console.log('❌ Logged out - manual intervention required');
+                    await bot.telegram.sendMessage(ADMIN_ID, 
+                        '❌ *WhatsApp Logged Out*\n\n' +
+                        'Clear SESSION_DATA and restart the bot.',
+                        { parse_mode: 'Markdown' }
+                    ).catch(console.error);
                 }
             } else if (connection === 'open') {
-                console.log('✅ WhatsApp connected successfully!');
+                console.log('✅ WhatsApp connected!');
                 isReady = true;
+                qrRetries = 0;
+                initAttempts = 0;
                 
+                // Setup group and process queue
                 await setupTargetGroup();
                 
-                // Process queued messages
                 if (messageQueue.length > 0) {
                     console.log(`📨 Processing ${messageQueue.length} queued messages...`);
-                    processQueuedMessages();
+                    setTimeout(processQueuedMessages, 1000);
                 }
                 
-                // Keep connection alive
+                // Keep alive interval
                 setInterval(() => {
                     if (sock && isReady) {
                         sock.sendPresenceUpdate('available').catch(() => {});
@@ -216,24 +273,42 @@ async function initializeWhatsApp() {
             }
         });
         
-        // Error handling
+        // Handle errors
         sock.ev.on('error', (error) => {
             console.error('WhatsApp error:', error);
         });
         
+        // Handle incoming messages (optional)
+        sock.ev.on('messages.upsert', async (m) => {
+            if (m.type === 'notify') {
+                console.log('📩 New WhatsApp message received');
+            }
+        });
+        
     } catch (error) {
-        console.error('❌ WhatsApp initialization error:', error);
-        setTimeout(initializeWhatsApp, 5000);
+        console.error('❌ WhatsApp init failed:', error);
+        
+        if (initAttempts < 5) {
+            console.log(`🔄 Retrying in 5 seconds... (${initAttempts}/5)`);
+            setTimeout(initializeWhatsApp, 5000);
+        } else {
+            console.error('❌ Max initialization attempts reached');
+            await bot.telegram.sendMessage(ADMIN_ID, 
+                '❌ Failed to initialize WhatsApp after 5 attempts.\n\nUse /restart to try again.',
+                { parse_mode: 'Markdown' }
+            ).catch(console.error);
+        }
     }
 }
 
 async function setupTargetGroup() {
     try {
-        console.log('🔍 Looking for target WhatsApp group...');
+        console.log('🔍 Looking for WhatsApp groups...');
+        
         const groups = await sock.groupFetchAllParticipating();
         const groupList = Object.values(groups);
         
-        console.log(`Found ${groupList.length} WhatsApp groups`);
+        console.log(`Found ${groupList.length} groups`);
         
         const target = groupList.find(g => 
             g.subject && g.subject.toLowerCase().includes(GROUP_NAME.toLowerCase())
@@ -241,46 +316,44 @@ async function setupTargetGroup() {
         
         if (target) {
             targetGroupId = target.id;
-            console.log(`✅ Found target group: ${target.subject}`);
+            console.log(`✅ Target group found: ${target.subject}`);
             
-            try {
-                await bot.telegram.sendMessage(ADMIN_ID,
-                    `🎉 *Bot Ready!*\n\n` +
-                    `📱 WhatsApp: Connected\n` +
-                    `👥 Group: ${target.subject}\n` +
-                    `👤 Members: ${target.participants.length}\n` +
-                    `📨 Queue: ${messageQueue.length} messages\n` +
-                    `⚡ Speed: Ultra-fast forwarding\n\n` +
-                    `✅ Messages will now be forwarded automatically!`,
-                    { parse_mode: 'Markdown' }
-                );
-            } catch (error) {
-                console.error('Failed to send ready notification:', error);
+            await bot.telegram.sendMessage(ADMIN_ID,
+                `🎉 *Bot Ready!*\n\n` +
+                `📱 WhatsApp: Connected\n` +
+                `👥 Group: ${target.subject}\n` +
+                `👤 Members: ${target.participants.length}\n` +
+                `📨 Queue: ${messageQueue.length} messages\n\n` +
+                `✅ Forwarding active!`,
+                { parse_mode: 'Markdown' }
+            ).catch(console.error);
+            
+            // Start processing queue if any
+            if (messageQueue.length > 0) {
+                processQueuedMessages();
             }
         } else {
             console.log(`❌ Group "${GROUP_NAME}" not found`);
-            const availableGroups = groupList
-                .map(g => `• ${g.subject}`)
-                .slice(0, 10)
-                .join('\n');
-                
-            try {
-                await bot.telegram.sendMessage(ADMIN_ID,
-                    `⚠️ Group "${GROUP_NAME}" not found\n\n` +
-                    `Available groups:\n${availableGroups}`,
-                    { parse_mode: 'Markdown' }
-                );
-            } catch (error) {
-                console.error('Failed to send group list:', error);
-            }
+            
+            const groupNames = groupList.map(g => g.subject).slice(0, 10).join('\n• ');
+            
+            await bot.telegram.sendMessage(ADMIN_ID,
+                                `⚠️ *Group Not Found*\n\n` +
+                `Looking for: "${GROUP_NAME}"\n\n` +
+                `Available groups:\n• ${groupNames}`,
+                { parse_mode: 'Markdown' }
+            ).catch(console.error);
         }
     } catch (error) {
         console.error('Group setup error:', error);
+        setTimeout(setupTargetGroup, 5000);
     }
 }
 
 async function processQueuedMessages() {
-    if (isProcessing || messageQueue.length === 0 || !isReady || !targetGroupId) return;
+    if (isProcessing || messageQueue.length === 0 || !isReady || !targetGroupId) {
+        return;
+    }
     
     isProcessing = true;
     console.log(`📤 Processing ${messageQueue.length} queued messages...`);
@@ -289,24 +362,49 @@ async function processQueuedMessages() {
         const msg = messageQueue.shift();
         
         try {
-            await sock.sendMessage(targetGroupId, msg.content);
-            console.log(`✅ Sent queued message (${Date.now() - msg.timestamp}ms old)`);
+            // Ultra-fast forwarding based on message type
+            if (msg.type === 'photo' && msg.post?.photo) {
+                const photoId = msg.post.photo[msg.post.photo.length - 1].file_id;
+                const buffer = await downloadFile(photoId);
+                await sock.sendMessage(targetGroupId, {
+                    image: buffer,
+                    caption: msg.post.caption || ''
+                });
+            } else if (msg.type === 'video' && msg.post?.video) {
+                const buffer = await downloadFile(msg.post.video.file_id);
+                await sock.sendMessage(targetGroupId, {
+                    video: buffer,
+                    caption: msg.post.caption || ''
+                });
+            } else if (msg.type === 'document' && msg.post?.document) {
+                const buffer = await downloadFile(msg.post.document.file_id);
+                await sock.sendMessage(targetGroupId, {
+                    document: buffer,
+                    mimetype: msg.post.document.mime_type,
+                    fileName: msg.post.document.file_name,
+                    caption: msg.post.caption || ''
+                });
+            } else {
+                await sock.sendMessage(targetGroupId, msg.content);
+            }
+            
+            console.log(`✅ Sent queued message (${messageQueue.length} remaining)`);
         } catch (error) {
             console.error('Failed to send queued message:', error);
-            messageQueue.unshift(msg); // Put it back
-            break;
+            messageQueue.unshift(msg);
+            await delay(2000);
         }
         
-        // Small delay between messages
+        // Minimal delay for ultra-fast sending
         if (messageQueue.length > 0) {
-            await new Promise(r => setTimeout(r, 100));
+            await delay(100);
         }
     }
     
     isProcessing = false;
 }
 
-// Fast file download
+// Ultra-fast file download
 async function downloadFile(fileId) {
     try {
         const file = await bot.telegram.getFile(fileId);
@@ -315,10 +413,7 @@ async function downloadFile(fileId) {
         const response = await axios.get(url, {
             responseType: 'arraybuffer',
             timeout: 30000,
-            maxContentLength: 100 * 1024 * 1024,
-            headers: {
-                'Connection': 'keep-alive'
-            }
+            maxContentLength: 100 * 1024 * 1024
         });
         
         return Buffer.from(response.data);
@@ -328,14 +423,13 @@ async function downloadFile(fileId) {
     }
 }
 
-// Message forwarding handler
-// Message forwarding handler
+// Message forwarding handler - ULTRA FAST
 bot.on('channel_post', async (ctx) => {
     const startTime = Date.now();
     const post = ctx.channelPost;
     const text = post.text || post.caption || '';
     
-    console.log(`📨 New message from Telegram channel: ${text ? text.substring(0, 50) + '...' : '[Media]'}`);
+    console.log(`📨 New message: ${text?.substring(0, 50) || '[Media]'}`);
     
     // Queue if not ready
     if (!isReady || !targetGroupId) {
@@ -345,56 +439,87 @@ bot.on('channel_post', async (ctx) => {
             type: post.photo ? 'photo' : post.video ? 'video' : post.document ? 'document' : 'text',
             post: post
         });
-        console.log(`📥 Message queued (${messageQueue.length} in queue)`);
+        
+        console.log(`📥 Queued (${messageQueue.length} total) - WhatsApp ${isReady ? 'ready' : 'not ready'}`);
+        
+        // Try to initialize if not ready
+        if (!isReady && initAttempts === 0) {
+            initializeWhatsApp();
+        }
+        
         return;
     }
     
+    // Ultra-fast forwarding
     try {
         if (post.photo) {
-            // Download and send photo
+            // Download and send immediately
             const photoId = post.photo[post.photo.length - 1].file_id;
-            const buffer = await downloadFile(photoId);
-            await sock.sendMessage(targetGroupId, {
-                image: buffer,
-                caption: text
+            downloadFile(photoId).then(async (buffer) => {
+                await sock.sendMessage(targetGroupId, {
+                    image: buffer,
+                    caption: text
+                });
+                console.log(`✅ Photo sent in ${Date.now() - startTime}ms`);
+            }).catch(error => {
+                console.error('Photo send error:', error);
+                messageQueue.push({
+                    content: { text: text || '[Photo]' },
+                    timestamp: startTime,
+                    type: 'photo',
+                    post: post
+                });
             });
-            console.log(`✅ Photo sent in ${Date.now() - startTime}ms`);
             
         } else if (post.video) {
-            // Download and send video
-            const buffer = await downloadFile(post.video.file_id);
-            await sock.sendMessage(targetGroupId, {
-                video: buffer,
-                caption: text
+            downloadFile(post.video.file_id).then(async (buffer) => {
+                await sock.sendMessage(targetGroupId, {
+                    video: buffer,
+                    caption: text
+                });
+                console.log(`✅ Video sent in ${Date.now() - startTime}ms`);
+            }).catch(error => {
+                console.error('Video send error:', error);
+                messageQueue.push({
+                    content: { text: text || '[Video]' },
+                    timestamp: startTime,
+                    type: 'video',
+                    post: post
+                });
             });
-            console.log(`✅ Video sent in ${Date.now() - startTime}ms`);
             
         } else if (post.document) {
-            // Download and send document
-            const buffer = await downloadFile(post.document.file_id);
-            await sock.sendMessage(targetGroupId, {
-                document: buffer,
-                mimetype: post.document.mime_type,
-                fileName: post.document.file_name,
-                caption: text
+            downloadFile(post.document.file_id).then(async (buffer) => {
+                await sock.sendMessage(targetGroupId, {
+                    document: buffer,
+                    mimetype: post.document.mime_type,
+                    fileName: post.document.file_name,
+                    caption: text
+                });
+                console.log(`✅ Document sent in ${Date.now() - startTime}ms`);
+            }).catch(error => {
+                console.error('Document send error:', error);
+                messageQueue.push({
+                    content: { text: text || '[Document]' },
+                    timestamp: startTime,
+                    type: 'document',
+                    post: post
+                });
             });
-            console.log(`✅ Document sent in ${Date.now() - startTime}ms`);
             
         } else if (text) {
-            // Send text message
             await sock.sendMessage(targetGroupId, { text });
             console.log(`✅ Text sent in ${Date.now() - startTime}ms`);
         }
     } catch (error) {
         console.error('Forward error:', error);
         messageQueue.push({
-            content: { text: text || '[Failed message]' },
+            content: { text: text || '[Failed]' },
             timestamp: startTime,
             type: 'retry',
             post: post
         });
         
-        // Process queue after error
         setTimeout(processQueuedMessages, 2000);
     }
 });
@@ -406,12 +531,13 @@ bot.command('start', async (ctx) => {
     await ctx.reply(
         `🤖 *WhatsApp-Telegram Forwarder*\n\n` +
         `Commands:\n` +
-        `/status - Check bot status\n` +
-        `/restart - Restart WhatsApp connection\n` +
-        `/queue - View message queue\n` +
-        `/groups - List WhatsApp groups\n` +
-        `/session - Save/check session\n\n` +
-        `Bot will automatically forward messages from your Telegram channel to WhatsApp group.`,
+        `/status - Check status\n` +
+        `/restart - Restart WhatsApp\n` +
+        `/queue - View queue\n` +
+        `/groups - List groups\n` +
+        `/session - Save session\n` +
+        `/test - Test message\n` +
+        `/clear - Clear queue`,
         { parse_mode: 'Markdown' }
     );
 });
@@ -424,14 +550,12 @@ bot.command('status', async (ctx) => {
     const minutes = Math.floor((uptime % 3600) / 60);
     
     await ctx.reply(
-        `📊 *Bot Status*\n\n` +
-        `🤖 WhatsApp: ${isReady ? '✅ Connected' : '❌ Disconnected'}\n` +
-        `👥 Group: ${targetGroupId ? '✅ Found' : '❌ Not found'}\n` +
-        `📨 Queue: ${messageQueue.length} messages\n` +
-        `⏱️ Uptime: ${hours}h ${minutes}m\n` +
-        `💾 Session: ${SESSION_DATA ? '✅ Loaded' : '❌ Not set'}\n` +
-        `🚀 Mode: Ultra-fast forwarding\n` +
-        `🌐 URL: ${process.env.RENDER_EXTERNAL_URL || 'Not on Render'}`,
+        `📊 *Status*\n\n` +
+        `WhatsApp: ${isReady ? '✅ Connected' : '❌ Disconnected'}\n` +
+        `Group: ${targetGroupId ? '✅ Found' : '❌ Not found'}\n` +
+        `Queue: ${messageQueue.length} messages\n` +
+        `Uptime: ${hours}h ${minutes}m\n` +
+        `Session: ${SESSION_DATA ? '✅ Loaded' : '❌ Not set'}`,
         { parse_mode: 'Markdown' }
     );
 });
@@ -439,28 +563,30 @@ bot.command('status', async (ctx) => {
 bot.command('restart', async (ctx) => {
     if (ctx.from.id.toString() !== ADMIN_ID) return;
     
-    await ctx.reply('♻️ Restarting WhatsApp connection...');
+    await ctx.reply('♻️ Restarting WhatsApp...');
     isReady = false;
+    initAttempts = 0;
+    
     if (sock) {
         sock.end();
+        sock = null;
     }
-    setTimeout(initializeWhatsApp, 3000);
+    
+    setTimeout(initializeWhatsApp, 2000);
 });
 
 bot.command('queue', async (ctx) => {
     if (ctx.from.id.toString() !== ADMIN_ID) return;
     
     if (messageQueue.length === 0) {
-        await ctx.reply('📨 No messages in queue');
+        await ctx.reply('📨 Queue is empty');
     } else {
-        const queueInfo = messageQueue.slice(0, 10).map((m, i) => 
-            `${i + 1}. ${m.type} - ${m.content.text?.substring(0, 30) || '[Media]'}...`
+        const preview = messageQueue.slice(0, 5).map((m, i) => 
+            `${i+1}. ${m.type} - ${m.content.text?.substring(0, 30) || 'Media'}`
         ).join('\n');
         
         await ctx.reply(
-            `📨 *Queue Status*\n\n` +
-            `Total: ${messageQueue.length} messages\n\n` +
-            `Recent messages:\n${queueInfo}`,
+            `📨 *Queue: ${messageQueue.length} messages*\n\n${preview}`,
             { parse_mode: 'Markdown' }
         );
     }
@@ -476,12 +602,12 @@ bot.command('groups', async (ctx) => {
     
     try {
         const groups = await sock.groupFetchAllParticipating();
-        const groupList = Object.values(groups)
-            .map((g, i) => `${i + 1}. ${g.subject} (${g.participants.length} members)`)
+        const list = Object.values(groups)
+            .map((g, i) => `${i+1}. ${g.subject}`)
             .slice(0, 20)
             .join('\n');
             
-        await ctx.reply(`📱 *WhatsApp Groups:*\n\n${groupList}`, { parse_mode: 'Markdown' });
+        await ctx.reply(`📱 *Groups:*\n\n${list}`, { parse_mode: 'Markdown' });
     } catch (error) {
         await ctx.reply(`❌ Error: ${error.message}`);
     }
@@ -491,122 +617,103 @@ bot.command('session', async (ctx) => {
     if (ctx.from.id.toString() !== ADMIN_ID) return;
     
     if (SESSION_DATA) {
-        await ctx.reply('✅ Session is set in environment variables');
+        await ctx.reply('✅ Session already saved in environment');
     } else {
         await saveSessionToEnv();
-        await ctx.reply('📤 Session saved! Check server logs for SESSION_DATA variable');
+        await ctx.reply('💾 Check logs for SESSION_DATA');
     }
 });
 
-// Keep-alive mechanism
+bot.command('test', async (ctx) => {
+    if (ctx.from.id.toString() !== ADMIN_ID) return;
+    
+    if (!isReady || !targetGroupId) {
+        await ctx.reply('❌ Not ready');
+        return;
+    }
+    
+    try {
+        await sock.sendMessage(targetGroupId, { 
+            text: `🧪 Test message\nTime: ${new Date().toLocaleString()}`
+        });
+        await ctx.reply('✅ Test sent');
+    } catch (error) {
+        await ctx.reply(`❌ Failed: ${error.message}`);
+    }
+});
+
+bot.command('clear', async (ctx) => {
+    if (ctx.from.id.toString() !== ADMIN_ID) return;
+    
+    const count = messageQueue.length;
+    messageQueue.length = 0;
+    await ctx.reply(`🗑️ Cleared ${count} messages`);
+});
+
+// Keep alive mechanism
 const keepAlive = () => {
-    // Ping every 5 minutes
     setInterval(async () => {
-        const url = process.env.RENDER_EXTERNAL_URL;
-        if (url) {
+        if (process.env.RENDER_EXTERNAL_URL) {
             try {
-                await axios.get(url + '/health', { timeout: 10000 });
-                console.log('✅ Keep-alive ping sent');
-            } catch (error) {
-                console.error('Keep-alive error:', error.message);
-            }
+                await axios.get(process.env.RENDER_EXTERNAL_URL + '/health', { timeout: 10000 });
+                console.log('Keep-alive ping');
+            } catch (error) {}
         }
         
-        // Keep WhatsApp connection alive
         if (sock && isReady) {
-            try {
-                await sock.sendPresenceUpdate('available');
-            } catch (error) {}
+            sock.sendPresenceUpdate('available').catch(() => {});
         }
-    }, 5 * 60 * 1000); // 5 minutes
-    
-    // Aggressive ping for first 30 minutes
-    const aggressivePing = setInterval(async () => {
-        const url = process.env.RENDER_EXTERNAL_URL;
-        if (url) {
-            try {
-                await axios.get(url + '/health', { timeout: 5000 });
-            } catch (error) {}
-        }
-    }, 60 * 1000); // Every minute
-    
-    // Stop aggressive ping after 30 minutes
-    setTimeout(() => clearInterval(aggressivePing), 30 * 60 * 1000);
+    }, 5 * 60 * 1000);
 };
 
 // Error handling
 process.on('uncaughtException', (error) => {
-    console.error('❌ Uncaught Exception:', error);
-    
-    // Don't exit on port errors during deployment
-    if (error.code === 'EADDRINUSE') {
-        console.error('Port already in use, this is likely a deployment issue');
-        return;
+    console.error('Uncaught Exception:', error);
+    if (error.code !== 'EADDRINUSE') {
+        setTimeout(() => process.exit(1), 1000);
     }
-    
-    // Notify admin if possible
-    if (ADMIN_ID && bot && isReady) {
-        bot.telegram.sendMessage(ADMIN_ID, `⚠️ Error: ${error.message}\n\nBot will restart...`).catch(() => {});
-    }
-    
-    // Restart after 1 second
-    setTimeout(() => process.exit(1), 1000);
 });
 
 process.on('unhandledRejection', (error) => {
-    console.error('❌ Unhandled Rejection:', error);
+    console.error('Unhandled Rejection:', error);
 });
 
-// Main startup function
+// Main startup
 async function startBot() {
     console.log('🚀 Starting WhatsApp-Telegram Forwarder...');
-    console.log(`📍 Port: ${PORT}`);
-    console.log(`💾 Session: ${SESSION_DATA ? 'Found' : 'Not set'}`);
-    console.log(`🤖 Bot Token: ${BOT_TOKEN ? 'Set' : 'Missing!'}`);
-    console.log(`👤 Admin ID: ${ADMIN_ID ? 'Set' : 'Missing!'}`);
     
     try {
-        // Launch Telegram bot with polling
-        console.log('📱 Starting Telegram bot...');
+        // Start Telegram bot
         await bot.launch({
             allowedUpdates: ['message', 'channel_post', 'callback_query']
         });
         
-        console.log('✅ Telegram bot started successfully');
+        console.log('✅ Telegram bot started');
         
-        // Test Telegram connection
-        try {
-            const me = await bot.telegram.getMe();
-            console.log(`🤖 Bot username: @${me.username}`);
-            
-            // Send startup notification
-            await bot.telegram.sendMessage(ADMIN_ID, 
-                '🚀 *Bot Started!*\n\n' +
-                `🤖 Bot: @${me.username}\n` +
-                `📍 Port: ${PORT}\n` +
-                `💾 Session: ${SESSION_DATA ? '✅ Will restore' : '❌ First time - QR needed'}\n` +
-                '⏳ Initializing WhatsApp...',
-                { parse_mode: 'Markdown' }
-            );
-        } catch (error) {
-            console.error('❌ Failed to connect to Telegram:', error.message);
-        }
+        // Notify admin
+        const me = await bot.telegram.getMe();
+        await bot.telegram.sendMessage(ADMIN_ID, 
+            `🚀 *Bot Started!*\n\n` +
+            `Bot: @${me.username}\n` +
+            `Session: ${SESSION_DATA ? 'Found ✅' : 'Not found ❌'}\n\n` +
+            `Initializing WhatsApp...`,
+            { parse_mode: 'Markdown' }
+        ).catch(console.error);
         
-        // Initialize WhatsApp after 2 seconds
+        // Initialize WhatsApp
         setTimeout(initializeWhatsApp, 2000);
         
-        // Start keep-alive mechanism
+        // Start keep-alive
         keepAlive();
         
     } catch (error) {
-        console.error('❌ Startup error:', error);
+        console.error('Startup error:', error);
         process.exit(1);
     }
 }
 
 // Graceful shutdown
 process.once('SIGINT', () => {
-    console.log('SIGINT received, shutting down gracefully...');
     bot.stop('SIGINT');
     if (sock) sock.end();
     server.close();
@@ -614,7 +721,6 @@ process.once('SIGINT', () => {
 });
 
 process.once('SIGTERM', () => {
-    console.log('SIGTERM received, shutting down gracefully...');
     bot.stop('SIGTERM');
     if (sock) sock.end();
     server.close();
@@ -622,11 +728,8 @@ process.once('SIGTERM', () => {
 });
 
 // Start the bot
-console.log('=====================================');
-console.log('WhatsApp-Telegram Forwarder v3.0');
-console.log('=====================================');
-
 startBot().catch(error => {
-    console.error('❌ Failed to start bot:', error);
+    console.error('Failed to start:', error);
     process.exit(1);
 });
+                

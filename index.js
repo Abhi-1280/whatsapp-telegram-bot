@@ -32,8 +32,14 @@ if (!ADMIN_ID) {
     process.exit(1);
 }
 
-// Baileys WhatsApp
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, makeInMemoryStore, delay } = require('@whiskeysockets/baileys');
+// Baileys WhatsApp - FIXED IMPORTS
+const { 
+    default: makeWASocket, 
+    useMultiFileAuthState, 
+    DisconnectReason, 
+    fetchLatestBaileysVersion,
+    delay
+} = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const QRCode = require('qrcode');
 
@@ -43,7 +49,6 @@ let isReady = false;
 let targetGroupId = null;
 const messageQueue = [];
 let isProcessing = false;
-let store;
 let qrRetries = 0;
 let initAttempts = 0;
 
@@ -93,7 +98,7 @@ async function saveSessionToEnv() {
                     `📄 *Part ${i + 1}/${chunks.length}:*\n\n\`\`\`\n${chunks[i]}\n\`\`\``,
                     { parse_mode: 'Markdown' }
                 );
-                await delay(1000); // Small delay between messages
+                await delay(1000);
             }
             
             await bot.telegram.sendMessage(ADMIN_ID, 
@@ -159,10 +164,7 @@ async function initializeWhatsApp() {
         const { state, saveCreds } = await useMultiFileAuthState('./auth_session');
         const { version } = await fetchLatestBaileysVersion();
         
-        store = makeInMemoryStore({
-            logger: pino().child({ level: 'silent', stream: 'store' })
-        });
-        
+        // Create socket WITHOUT store (which is causing the error)
         sock = makeWASocket({
             version,
             logger: pino({ level: 'silent' }),
@@ -176,13 +178,10 @@ async function initializeWhatsApp() {
             keepAliveIntervalMs: 30000,
             connectTimeoutMs: 60000,
             qrTimeout: 60000,
-            getMessage: async () => null,
-            store
+            getMessage: async () => null
         });
         
-        if (store) {
-            store.bind(sock.ev);
-        }
+        console.log('✅ WhatsApp socket created');
         
         // Handle credentials update
         sock.ev.on('creds.update', async () => {
@@ -328,7 +327,7 @@ async function setupTargetGroup() {
                 { parse_mode: 'Markdown' }
             ).catch(console.error);
             
-            // Start processing queue if any
+                        // Start processing queue if any
             if (messageQueue.length > 0) {
                 processQueuedMessages();
             }
@@ -338,7 +337,7 @@ async function setupTargetGroup() {
             const groupNames = groupList.map(g => g.subject).slice(0, 10).join('\n• ');
             
             await bot.telegram.sendMessage(ADMIN_ID,
-                                `⚠️ *Group Not Found*\n\n` +
+                `⚠️ *Group Not Found*\n\n` +
                 `Looking for: "${GROUP_NAME}"\n\n` +
                 `Available groups:\n• ${groupNames}`,
                 { parse_mode: 'Markdown' }
@@ -392,12 +391,12 @@ async function processQueuedMessages() {
         } catch (error) {
             console.error('Failed to send queued message:', error);
             messageQueue.unshift(msg);
-            await delay(2000);
+            await new Promise(r => setTimeout(r, 2000));
         }
         
         // Minimal delay for ultra-fast sending
         if (messageQueue.length > 0) {
-            await delay(100);
+            await new Promise(r => setTimeout(r, 100));
         }
     }
     
@@ -732,4 +731,3 @@ startBot().catch(error => {
     console.error('Failed to start:', error);
     process.exit(1);
 });
-                

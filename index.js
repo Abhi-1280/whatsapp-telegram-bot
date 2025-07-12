@@ -3,6 +3,7 @@ const { Telegraf } = require('telegraf');
 const axios = require('axios');
 const fs = require('fs').promises;
 const path = require('path');
+const crypto = require('crypto');
 
 // Express setup for Render
 const app = express();
@@ -53,8 +54,118 @@ let isProcessing = false;
 let qrRetries = 0;
 let initAttempts = 0;
 
+// Duplicate detection system
+const messageHistory = new Map(); // Store message hashes
+const DUPLICATE_CHECK_WINDOW = 24 * 60 * 60 * 1000; // 24 hours
+const MAX_HISTORY_SIZE = 10000; // Maximum number of messages to track
+const DUPLICATE_CACHE_FILE = './duplicate_cache.json';
+
 // Initialize Telegram bot
 const bot = new Telegraf(BOT_TOKEN);
+
+// Function to generate message hash
+function generateMessageHash(message) {
+    const content = {
+        text: message.text || message.caption || '',
+        type: message.photo ? 'photo' : message.video ? 'video' : message.document ? 'document' : 'text',
+        fileId: message.photo ? message.photo[message.photo.length - 1].file_id : 
+                message.video ? message.video.file_id : 
+                message.document ? message.document.file_id : null,
+        fileSize: message.photo ? message.photo[message.photo.length - 1].file_size :
+                  message.video ? message.video.file_size :
+                  message.document ? message.document.file_size : null
+    };
+    
+    // Create hash from content
+    const hashString = JSON.stringify(content);
+    return crypto.createHash('sha256').update(hashString).digest('hex');
+}
+
+// Load duplicate cache from file
+async function loadDuplicateCache() {
+    try {
+        const data = await fs.readFile(DUPLICATE_CACHE_FILE, 'utf-8');
+        const cache = JSON.parse(data);
+        
+        // Restore cache with Date objects
+        for (const [hash, timestamp] of Object.entries(cache)) {
+            messageHistory.set(hash, new Date(timestamp));
+        }
+        
+        console.log(`📋 Loaded ${messageHistory.size} messages from duplicate cache`);
+        cleanupOldMessages(); // Clean up old entries immediately
+    } catch (error) {
+        console.log('📋 No duplicate cache found, starting fresh');
+    }
+}
+
+// Save duplicate cache to file
+async function saveDuplicateCache() {
+    try {
+        const cache = {};
+        for (const [hash, timestamp] of messageHistory.entries()) {
+            cache[hash] = timestamp.toISOString();
+        }
+        
+        await fs.writeFile(DUPLICATE_CACHE_FILE, JSON.stringify(cache, null, 2));
+        console.log(`💾 Saved ${messageHistory.size} messages to duplicate cache`);
+    } catch (error) {
+        console.error('Failed to save duplicate cache:', error);
+    }
+}
+
+// Clean up old messages from history
+function cleanupOldMessages() {
+    const now = Date.now();
+    let cleaned = 0;
+    
+    for (const [hash, timestamp] of messageHistory.entries()) {
+        if (now - timestamp.getTime() > DUPLICATE_CHECK_WINDOW) {
+            messageHistory.delete(hash);
+            cleaned++;
+        }
+    }
+    
+    // Also limit size if too large
+    if (messageHistory.size > MAX_HISTORY_SIZE) {
+        const sortedEntries = [...messageHistory.entries()]
+            .sort((a, b) => a[1].getTime() - b[1].getTime());
+        
+        const toRemove = sortedEntries.slice(0, messageHistory.size - MAX_HISTORY_SIZE);
+        for (const [hash] of toRemove) {
+            messageHistory.delete(hash);
+            cleaned++;
+        }
+    }
+    
+    if (cleaned > 0) {
+        console.log(`🧹 Cleaned ${cleaned} old messages from history`);
+    }
+}
+
+// Check if message is duplicate
+function isDuplicate(messageHash) {
+    if (messageHistory.has(messageHash)) {
+        const timestamp = messageHistory.get(messageHash);
+        const age = Date.now() - timestamp.getTime();
+        
+        if (age < DUPLICATE_CHECK_WINDOW) {
+            console.log(`🔁 Duplicate detected (age: ${Math.floor(age / 1000 / 60)} minutes)`);
+            return true;
+        }
+    }
+    return false;
+}
+
+// Add message to history
+function addToHistory(messageHash) {
+    messageHistory.set(messageHash, new Date());
+    
+    // Save cache periodically
+    if (messageHistory.size % 10 === 0) {
+        saveDuplicateCache();
+    }
+}
 
 // Session management functions
 async function saveSessionToEnv() {
@@ -217,7 +328,7 @@ async function initializeWhatsApp() {
                     
                     await bot.telegram.sendPhoto(ADMIN_ID, { source: qrBuffer }, {
                         caption: `📱 *WhatsApp QR Code*\n\n` +
-                                `⚠️ *SCAN NOW - Expires in 60 seconds!*\n\n` +
+                                                                `⚠️ *SCAN NOW - Expires in 60 seconds!*\n\n` +
                                 `Steps:\n` +
                                 `1️⃣ Open WhatsApp\n` +
                                 `2️⃣ Tap Menu ⋮ → Linked Devices\n` +
@@ -305,7 +416,7 @@ async function setupTargetCommunity() {
     try {
         console.log('🔍 Looking for WhatsApp communities and groups...');
         
-                // First, get all groups (communities are also listed here)
+        // First, get all groups (communities are also listed here)
         const groups = await sock.groupFetchAllParticipating();
         const groupList = Object.values(groups);
         
@@ -360,10 +471,11 @@ async function setupTargetCommunity() {
             
             await bot.telegram.sendMessage(ADMIN_ID,
                 `🎉 *Bot Ready!*\n\n` +
-                `📱 WhatsApp: Connected\n` +
+                                `📱 WhatsApp: Connected\n` +
                 `🏘️ Community: ${targetCommunity.subject}\n` +
                 `📢 Target: ${targetAnnouncementId === targetCommunityId ? 'Main Community' : 'Announcement Group'}\n` +
-                `📨 Queue: ${messageQueue.length} messages\n\n` +
+                `📨 Queue: ${messageQueue.length} messages\n` +
+                `🔁 Duplicate cache: ${messageHistory.size} messages\n\n` +
                 `✅ Forwarding active!`,
                 { parse_mode: 'Markdown' }
             ).catch(console.error);
@@ -387,7 +499,8 @@ async function setupTargetCommunity() {
                     `📱 WhatsApp: Connected\n` +
                     `👥 Group: ${target.subject}\n` +
                     `👤 Members: ${target.participants?.length || 'Unknown'}\n` +
-                    `📨 Queue: ${messageQueue.length} messages\n\n` +
+                    `📨 Queue: ${messageQueue.length} messages\n` +
+                    `🔁 Duplicate cache: ${messageHistory.size} messages\n\n` +
                     `✅ Forwarding active!`,
                     { parse_mode: 'Markdown' }
                 ).catch(console.error);
@@ -427,6 +540,12 @@ async function processQueuedMessages() {
     while (messageQueue.length > 0 && isReady && targetAnnouncementId) {
         const msg = messageQueue.shift();
         
+        // Check for duplicate before sending
+        if (msg.hash && isDuplicate(msg.hash)) {
+            console.log(`🔁 Skipping duplicate from queue`);
+            continue;
+        }
+        
         try {
             // Ultra-fast forwarding based on message type
             if (msg.type === 'photo' && msg.post?.photo) {
@@ -452,6 +571,11 @@ async function processQueuedMessages() {
                 });
             } else {
                 await sock.sendMessage(targetAnnouncementId, msg.content);
+            }
+            
+            // Add to history after successful send
+            if (msg.hash) {
+                addToHistory(msg.hash);
             }
             
             console.log(`✅ Sent queued message (${messageQueue.length} remaining)`);
@@ -489,11 +613,20 @@ async function downloadFile(fileId) {
     }
 }
 
-// Message forwarding handler - ULTRA FAST
+// Message forwarding handler - ULTRA FAST with duplicate detection
 bot.on('channel_post', async (ctx) => {
     const startTime = Date.now();
     const post = ctx.channelPost;
     const text = post.text || post.caption || '';
+    
+    // Generate hash for duplicate detection
+    const messageHash = generateMessageHash(post);
+    
+    // Check if duplicate
+    if (isDuplicate(messageHash)) {
+        console.log(`🔁 Duplicate message detected, skipping: ${text?.substring(0, 50) || '[Media]'}`);
+        return;
+    }
     
     console.log(`📨 New message: ${text?.substring(0, 50) || '[Media]'}`);
     
@@ -503,7 +636,8 @@ bot.on('channel_post', async (ctx) => {
             content: { text: text || '[Media message]' },
             timestamp: startTime,
             type: post.photo ? 'photo' : post.video ? 'video' : post.document ? 'document' : 'text',
-            post: post
+            post: post,
+            hash: messageHash
         });
         
         console.log(`📥 Queued (${messageQueue.length} total) - WhatsApp ${isReady ? 'ready' : 'not ready'}`);
@@ -515,6 +649,9 @@ bot.on('channel_post', async (ctx) => {
         
         return;
     }
+    
+    // Add to history immediately to prevent rapid duplicates
+    addToHistory(messageHash);
     
     // Ultra-fast forwarding
     try {
@@ -529,11 +666,14 @@ bot.on('channel_post', async (ctx) => {
                 console.log(`✅ Photo sent in ${Date.now() - startTime}ms`);
             }).catch(error => {
                 console.error('Photo send error:', error);
+                // Remove from history if failed
+                messageHistory.delete(messageHash);
                 messageQueue.push({
                     content: { text: text || '[Photo]' },
                     timestamp: startTime,
                     type: 'photo',
-                    post: post
+                    post: post,
+                    hash: messageHash
                 });
             });
             
@@ -546,11 +686,13 @@ bot.on('channel_post', async (ctx) => {
                 console.log(`✅ Video sent in ${Date.now() - startTime}ms`);
             }).catch(error => {
                 console.error('Video send error:', error);
+                messageHistory.delete(messageHash);
                 messageQueue.push({
                     content: { text: text || '[Video]' },
                     timestamp: startTime,
                     type: 'video',
-                    post: post
+                    post: post,
+                    hash: messageHash
                 });
             });
             
@@ -565,11 +707,13 @@ bot.on('channel_post', async (ctx) => {
                 console.log(`✅ Document sent in ${Date.now() - startTime}ms`);
             }).catch(error => {
                 console.error('Document send error:', error);
+                messageHistory.delete(messageHash);
                 messageQueue.push({
                     content: { text: text || '[Document]' },
                     timestamp: startTime,
                     type: 'document',
-                    post: post
+                    post: post,
+                    hash: messageHash
                 });
             });
             
@@ -579,11 +723,14 @@ bot.on('channel_post', async (ctx) => {
         }
     } catch (error) {
         console.error('Forward error:', error);
+        // Remove from history if failed
+        messageHistory.delete(messageHash);
         messageQueue.push({
             content: { text: text || '[Failed]' },
             timestamp: startTime,
             type: 'retry',
-            post: post
+            post: post,
+            hash: messageHash
         });
         
         setTimeout(processQueuedMessages, 2000);
@@ -603,7 +750,9 @@ bot.command('start', async (ctx) => {
         `/groups - List groups/communities\n` +
         `/session - Save session\n` +
         `/test - Test message\n` +
-        `/clear - Clear queue`,
+        `/clear - Clear queue\n` +
+        `/duplicates - View duplicate stats\n` +
+        `/clearcache - Clear duplicate cache`,
         { parse_mode: 'Markdown' }
     );
 });
@@ -621,10 +770,53 @@ bot.command('status', async (ctx) => {
         `Community: ${targetCommunityId ? '✅ Found' : '❌ Not found'}\n` +
         `Target: ${targetAnnouncementId ? '✅ Set' : '❌ Not set'}\n` +
         `Queue: ${messageQueue.length} messages\n` +
+        `Duplicate cache: ${messageHistory.size} messages\n` +
         `Uptime: ${hours}h ${minutes}m\n` +
         `Session: ${SESSION_DATA ? '✅ Loaded' : '❌ Not set'}`,
         { parse_mode: 'Markdown' }
     );
+});
+
+bot.command('duplicates', async (ctx) => {
+    if (ctx.from.id.toString() !== ADMIN_ID) return;
+    
+    const now = Date.now();
+    const stats = {
+        total: messageHistory.size,
+        last1h: 0,
+        last24h: 0
+    };
+    
+    for (const [hash, timestamp] of messageHistory.entries()) {
+        const age = now - timestamp.getTime();
+        if (age < 60 * 60 * 1000) stats.last1h++;
+        if (age < 24 * 60 * 60 * 1000) stats.last24h++;
+    }
+    
+    await ctx.reply(
+        `🔁 *Duplicate Detection Stats*\n\n` +
+        `Total cached: ${stats.total}\n` +
+        `Last 1 hour: ${stats.last1h}\n` +
+        `Last 24 hours: ${stats.last24h}\n\n` +
+        `Cache window: 24 hours\n` +
+        `Max cache size: ${MAX_HISTORY_SIZE}`,
+        { parse_mode: 'Markdown' }
+    );
+});
+
+bot.command('clearcache', async (ctx) => {
+    if (ctx.from.id.toString() !== ADMIN_ID) return;
+    
+    const oldSize = messageHistory.size;
+    messageHistory.clear();
+    
+    try {
+        await fs.unlink(DUPLICATE_CACHE_FILE);
+    } catch (error) {
+        // File might not exist
+    }
+    
+    await ctx.reply(`🗑️ Cleared ${oldSize} messages from duplicate cache`);
 });
 
 bot.command('restart', async (ctx) => {
@@ -652,7 +844,7 @@ bot.command('queue', async (ctx) => {
             `${i+1}. ${m.type} - ${m.content.text?.substring(0, 30) || 'Media'}`
         ).join('\n');
         
-        await ctx.reply(
+                await ctx.reply(
             `📨 *Queue: ${messageQueue.length} messages*\n\n${preview}`,
             { parse_mode: 'Markdown' }
         );
@@ -670,7 +862,7 @@ bot.command('groups', async (ctx) => {
     try {
         const groups = await sock.groupFetchAllParticipating();
         const list = Object.values(groups)
-                        .map((g, i) => {
+            .map((g, i) => {
                 const type = g.isCommunity ? '🏘️' : '👥';
                 const isTarget = g.id === targetAnnouncementId ? ' ✅' : '';
                 return `${i+1}. ${type} ${g.subject}${isTarget}`;
@@ -788,6 +980,12 @@ bot.command('info', async (ctx) => {
     }
 });
 
+// Periodic cleanup task
+setInterval(() => {
+    cleanupOldMessages();
+    saveDuplicateCache();
+}, 60 * 60 * 1000); // Every hour
+
 // Keep alive mechanism
 const keepAlive = () => {
     setInterval(async () => {
@@ -808,7 +1006,10 @@ const keepAlive = () => {
 process.on('uncaughtException', (error) => {
     console.error('Uncaught Exception:', error);
     if (error.code !== 'EADDRINUSE') {
-        setTimeout(() => process.exit(1), 1000);
+        // Save cache before exit
+        saveDuplicateCache().finally(() => {
+            setTimeout(() => process.exit(1), 1000);
+        });
     }
 });
 
@@ -820,8 +1021,12 @@ process.on('unhandledRejection', (error) => {
 async function startBot() {
     console.log('🚀 Starting WhatsApp-Telegram Forwarder...');
     console.log(`🏘️ Looking for community: "${COMMUNITY_NAME}"`);
+    console.log('🔁 Duplicate detection enabled');
     
     try {
+        // Load duplicate cache
+        await loadDuplicateCache();
+        
         // Start Telegram bot
         await bot.launch({
             allowedUpdates: ['message', 'channel_post', 'callback_query']
@@ -835,7 +1040,8 @@ async function startBot() {
             `🚀 *Bot Started!*\n\n` +
             `Bot: @${me.username}\n` +
             `Target: ${COMMUNITY_NAME}\n` +
-            `Session: ${SESSION_DATA ? 'Found ✅' : 'Not found ❌'}\n\n` +
+            `Session: ${SESSION_DATA ? 'Found ✅' : 'Not found ❌'}\n` +
+            `Duplicate cache: ${messageHistory.size} messages\n\n` +
             `Initializing WhatsApp...`,
             { parse_mode: 'Markdown' }
         ).catch(console.error);
@@ -853,14 +1059,18 @@ async function startBot() {
 }
 
 // Graceful shutdown
-process.once('SIGINT', () => {
+process.once('SIGINT', async () => {
+    console.log('Shutting down...');
+    await saveDuplicateCache();
     bot.stop('SIGINT');
     if (sock) sock.end();
     server.close();
     process.exit(0);
 });
 
-process.once('SIGTERM', () => {
+process.once('SIGTERM', async () => {
+    console.log('Shutting down...');
+    await saveDuplicateCache();
     bot.stop('SIGTERM');
     if (sock) sock.end();
     server.close();
